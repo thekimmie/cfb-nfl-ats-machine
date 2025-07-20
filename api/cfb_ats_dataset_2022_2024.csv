@@ -1,0 +1,16 @@
+game_id,season,home_team,away_team,spread_open,spread_close,steam_move_flag,closing_line_value
+1,2022,Georgia,Florida,-7.5,-10.0,1,2.5
+2,2022,Alabama,LSU,-3.0,-2.5,0,-1.5
+3,2022,Michigan,Penn State,-6.0,-6.5,0,0.5
+4,2022,USC,Oregon,-4.5,-6.0,1,-0.5
+5,2022,Ohio State,Wisconsin,-9.0,-7.5,1,1.0
+1001,2023,Texas,Oklahoma,-2.5,-4.0,1,1.0
+1002,2023,Oregon,Utah,-6.0,-3.5,1,-2.0
+1003,2023,Tennessee,Georgia,1.0,-0.5,1,0.5
+1004,2023,LSU,Florida State,-1.5,-4.0,1,2.5
+1005,2023,Washington,USC,-3.5,-1.0,1,-1.0
+2001,2024,Notre Dame,Clemson,-3.5,-6.0,1,1.0
+2002,2024,Florida State,North Carolina,-2.0,-3.5,1,0.5
+2003,2024,Ole Miss,Miss State,-7.5,-5.5,1,-2.0
+2004,2024,Colorado,Arizona,1.5,3.5,1,1.5
+2005,2024,Texas A&M,Arkansas,-6.0,-3.0,1,-1.0
