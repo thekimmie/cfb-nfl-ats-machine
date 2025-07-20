@@ -16,7 +16,7 @@ app.add_middleware(
 )
 
 # Load data from CSV or prepare JSON
-DATA_PATH = os.path.join(os.path.dirname(__file__), "sample_data.csv")
+DATA_PATH = os.path.join(os.path.dirname(__file__), "cfb_ats_dataset_2022_2024.csv")
 data_df = pd.read_csv(DATA_PATH)
 
 @app.get("/api/model-data")
