@@ -1,3 +1,7 @@
+@app.get("/")
+def root():
+    return {"message": "The ATS Model API is live! 🎯 Try /api/model-data for predictions."}
+
 # api/main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
