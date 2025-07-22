@@ -1,3 +1,5 @@
+from fastapi import FastAPI
+
 app = FastAPI()  # ✅ Define app first
 
 @app.get("/")    # ✅ Then use it
