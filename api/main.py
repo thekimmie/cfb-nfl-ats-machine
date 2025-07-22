@@ -1,6 +1,8 @@
-@app.get("/")
+app = FastAPI()  # ✅ Define app first
+
+@app.get("/")    # ✅ Then use it
 def root():
-    return {"message": "The ATS Model API is live! 🎯 Try /api/model-data for predictions."}
+    return {"message": "The ATS Model API is live!"}
 
 # api/main.py
 from fastapi import FastAPI
