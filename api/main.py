@@ -93,15 +93,48 @@ def score_game(game, features_dict, sportsbook_spread):
 # --- API Endpoint ---
 @app.get("/api/model-data")
 def get_model_predictions():
-    # Step 1: Get live odds
-    params = {
-        "apiKey": API_KEY,
-        "regions": "us",
-        "markets": "spreads",
-        "oddsFormat": "decimal"
-    }
-    response = requests.get(ODDS_API_URL, params=params)
-    games = response.json()
+    # 🧪 Dummy Data Instead of Live API
+    games = [
+        {
+            "id": "1",
+            "home_team": "Georgia",
+            "away_team": "Florida",
+            "commence_time": "2025-08-30T19:00:00Z",
+            "bookmakers": [
+                {
+                    "markets": [
+                        {
+                            "key": "spreads",
+                            "outcomes": [
+                                { "name": "Florida", "point": -10.0 },
+                                { "name": "Georgia", "point": 10.0 }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "id": "2",
+            "home_team": "Alabama",
+            "away_team": "LSU",
+            "commence_time": "2025-08-30T22:00:00Z",
+            "bookmakers": [
+                {
+                    "markets": [
+                        {
+                            "key": "spreads",
+                            "outcomes": [
+                                { "name": "LSU", "point": -2.5 },
+                                { "name": "Alabama", "point": 2.5 }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        },
+        # ⬇️ Add remaining games here...
+    ]
 
     predictions = []
 
@@ -111,7 +144,7 @@ def get_model_predictions():
             away_team = game["away_team"]
             spread = None
 
-            # Find spread line from available books (use first one found)
+            # Same spread logic
             for bookmaker in game.get("bookmakers", []):
                 for market in bookmaker.get("markets", []):
                     if market["key"] == "spreads":
@@ -123,9 +156,8 @@ def get_model_predictions():
                     break
 
             if spread is None:
-                continue  # Skip if no valid spread
+                continue
 
-            # Build feature set
             game_data = {
                 "id": game["id"],
                 "home_team": home_team,
@@ -141,6 +173,3 @@ def get_model_predictions():
             continue
 
     return predictions
-
-# For Render
-handler = app
