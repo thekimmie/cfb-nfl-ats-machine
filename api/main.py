@@ -1,3 +1,21 @@
+import os
+import httpx                       # faster + async friendly
+
+# 1️⃣ grab from env
+RAPID_KEY  = os.getenv("RAPIDAPI_KEY")
+ODDS_HOST  = os.getenv("RAPIDAPI_HOST_ODDS")   # americanodds.p.rapidapi.com, etc.
+
+# 2️⃣ helper that fetches one endpoint ------------------------------
+async def fetch_rapid_odds(client, sport="nfl"):
+    url = f"https://{ODDS_HOST}/odds/{sport}"
+    headers = {
+        "X-RapidAPI-Key": RAPID_KEY,
+        "X-RapidAPI-Host": ODDS_HOST
+    }
+    r = await client.get(url, headers=headers, timeout=10)
+    r.raise_for_status()
+    return r.json()                # whatever the API returns
+
 from fastapi import FastAPI
 
 app = FastAPI()  # ✅ Define app first
