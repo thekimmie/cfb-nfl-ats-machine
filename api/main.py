@@ -33,7 +33,9 @@ INTERCEPT = meta.get("intercept", 0.0)
 
 
 # ── Load your trained model (optional if you want to use sklearn predict_proba) ──
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "final_ats_model.pkl")
+BASE_DIR    = os.path.dirname(__file__)
+PROJECT_DIR = os.path.abspath(os.path.join(BASE_DIR, os.pardir))
+MODEL_PATH  = os.path.join(PROJECT_DIR, "final_ats_model.pkl")
 with open(MODEL_PATH, "rb") as f:
     model = pickle.load(f)
 
