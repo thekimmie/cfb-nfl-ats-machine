@@ -97,15 +97,13 @@ def score(game: dict) -> dict:
 
 
 # ── API endpoint ─────────────────────────────────────────────────────────────
+
 @app.get("/api/model-data")
 async def model_data():
-    try:
-        raw_odds = await fetch_odds()
-        games    = parse_games(raw_odds)
-    except Exception as e:
-        # if the odds fetch fails, return an empty list (so Retool doesn’t break)
-        print("RapidAPI fetch failed:", e)
-        return []
+    # let any error bubble up for now
+    raw_odds = await fetch_odds()
+    games    = parse_games(raw_odds)
+    return [score(g) for g in games]
 
     # score + return
     return [score(g) for g in games]
