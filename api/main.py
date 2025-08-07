@@ -42,7 +42,7 @@ with open(MODEL_PATH, "rb") as f:
 
 # ── RapidAPI config ─────────────────────────────────────────────────────────
 RAPID_KEY     = os.getenv("RAPIDAPI_KEY")
-ODDS_HOST     = os.getenv("RAPIDAPI_HOST_ODDS")  # e.g. americanodds.p.rapidapi.com
+ODDS_HOST     = os.getenv("RAPIDAPI_HOST")  # e.g. americanodds.p.rapidapi.com
 SPORT         = "ncaaf"                         # or "nfl"
 
 
