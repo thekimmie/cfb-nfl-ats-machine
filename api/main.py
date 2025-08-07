@@ -41,9 +41,9 @@ with open(MODEL_PATH, "rb") as f:
 
 
 # ── RapidAPI config ─────────────────────────────────────────────────────────
-RAPID_KEY     = os.getenv("RAPIDAPI_KEY")
-ODDS_HOST     = os.getenv("RAPIDAPI_HOST")  # e.g. americanodds.p.rapidapi.com
-SPORT         = "ncaaf"                         # or "nfl"
+RAPID_KEY = os.getenv("RAPIDAPI_KEY")
+ODDS_HOST = os.getenv("RAPIDAPI_HOST")  # e.g. "americanodds.p.rapidapi.com"
+SPORT     = "ncaaf"                    # or "nfl"
 
 
 async def fetch_odds():
@@ -54,6 +54,11 @@ async def fetch_odds():
     }
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(url, headers=headers)
+
+        # DEBUG: log status code and first 200 characters of the body
+        print("⚙️  RapidAPI status:", resp.status_code)
+        print("⚙️  RapidAPI body:", resp.text[:200])
+
         resp.raise_for_status()
         return resp.json()
 
@@ -64,7 +69,6 @@ def parse_games(raw):
     for g in raw:
         home   = g["homeTeam"]
         away   = g["awayTeam"]
-        # adjust this path if your JSON differs
         spread = float(g["markets"][0]["outcomes"][0]["point"])
         games.append({
             "id":            str(g["id"]),
@@ -78,14 +82,11 @@ def parse_games(raw):
 
 def score(game: dict) -> dict:
     """Attach model_probability and model_pick to each game."""
-    # build feature vector in the correct order
     x = np.array([game.get(f, 0) for f in FEATURES]).reshape(1, -1)
 
-    # try sklearn-style predict_proba first
     try:
         prob = float(model.predict_proba(x)[0, 1])
     except Exception:
-        # fallback to manual linear calculation
         logit = float(INTERCEPT + np.dot(WEIGHTS, x.flatten()))
         prob  = 1 / (1 + np.exp(-logit))
 
@@ -96,14 +97,9 @@ def score(game: dict) -> dict:
     }
 
 
-# ── API endpoint ─────────────────────────────────────────────────────────────
-
 @app.get("/api/model-data")
 async def model_data():
-    # let any error bubble up for now
+    # Let any errors bubble up so we can see them in the logs
     raw_odds = await fetch_odds()
     games    = parse_games(raw_odds)
-    return [score(g) for g in games]
-
-    # score + return
     return [score(g) for g in games]
