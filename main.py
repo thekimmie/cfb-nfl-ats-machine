@@ -1,6 +1,6 @@
 # main.py  (repo root)
 
-import os, asyncio, time
+import os, asyncio, time, logging
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
 
@@ -40,6 +40,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Logging
+logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO))
+log = logging.getLogger("betting-machine")
+
 # ========= In-memory cache =========
 _cache: Dict[str, Dict[str, Any]] = {}  # key -> {"ts": epoch, "data": object}
 
@@ -59,6 +63,10 @@ def iso(dt: datetime) -> str:
 
 def parse_iso(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+def current_window():
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    return iso(now - timedelta(days=DAYS_BACK)), iso(now + timedelta(days=DAYS_AHEAD))
 
 def nearest_hour_point(points: List[Dict[str, Any]], kickoff_iso: str) -> Optional[Dict[str, Any]]:
     if not points: return None
@@ -122,16 +130,25 @@ async def fetch_odds_for(sport_key: str, start_iso: str, end_iso: str) -> List[D
         return data if isinstance(data, list) else []
 
 async def fetch_all_odds() -> List[Dict[str, Any]]:
-    now = datetime.utcnow().replace(tzinfo=timezone.utc)
-    start_iso = iso(now - timedelta(days=DAYS_BACK))
-    end_iso   = iso(now + timedelta(days=DAYS_AHEAD))
+    start_iso, end_iso = current_window()
     tasks = [fetch_odds_for(sk, start_iso, end_iso) for sk in SPORT_KEYS]
     results = await asyncio.gather(*tasks, return_exceptions=True)
+
     out: List[Dict[str, Any]] = []
-    for res in results:
-        if isinstance(res, Exception):  # swallow per-league failures
+    had_error = False
+    for sk, res in zip(SPORT_KEYS, results):
+        if isinstance(res, Exception):
+            had_error = True
+            log.error("Odds fetch failed for %s: %s", sk, res)
             continue
+        if not res:
+            log.warning("Odds fetch returned 0 events for %s in window %s → %s", sk, start_iso, end_iso)
         out.extend(res)
+
+    if not out and had_error:
+        # Surface that something failed so you don't just see [] forever
+        raise HTTPException(status_code=502, detail="All odds fetches failed; check /debug/odds")
+
     return out
 
 async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]:
@@ -334,8 +351,8 @@ async def build_rows() -> List[Dict[str, Any]]:
                 values = (nearest or {}).get("values", {})
                 row["weather_alert"] = compute_weather_alert(values)
                 row["weather_snapshot"] = values  # optional for detail UI
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("Weather fetch failed for %s vs %s: %s", away, home, e)
 
         rows.append(row)
 
@@ -345,14 +362,11 @@ async def build_rows() -> List[Dict[str, Any]]:
 # ========= Routes =========
 @app.get("/")
 async def root():
-    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    start_iso, end_iso = current_window()
     return {
         "ok": True,
-        "endpoints": ["/health", "/version", "/api/model-data"],
-        "window": {
-            "from": iso(now - timedelta(days=DAYS_BACK)),
-            "to":   iso(now + timedelta(days=DAYS_AHEAD))
-        }
+        "endpoints": ["/health", "/version", "/api/model-data", "/debug/env", "/debug/odds"],
+        "window": {"from": start_iso, "to": end_iso}
     }
 
 @app.get("/api/model-data")
@@ -366,3 +380,57 @@ async def health():
 @app.get("/version")
 async def version():
     return {"model": "lr_v1", "features": 18, "source": "odds+slate+weather", "ttl_seconds": CACHE_TTL}
+
+# ---- Debug endpoints ----
+@app.get("/debug/env")
+def debug_env():
+    start_iso, end_iso = current_window()
+    return {
+        "has_ODDS_API_KEY": bool(ODDS_API_KEY),
+        "has_TIO_API_KEY": bool(TIO_API_KEY),
+        "has_APISPORTS_KEY": bool(APISPORTS_KEY or os.getenv("RAPIDAPI_KEY")),
+        "has_CFBD_KEY": bool(CFBD_KEY),
+        "cors_origin": CORS_ORIGIN,
+        "window": {"from": start_iso, "to": end_iso},
+        "sport_keys": SPORT_KEYS,
+        "cache_ttl": CACHE_TTL,
+        "log_level": LOG_LEVEL,
+        "days_back": DAYS_BACK,
+        "days_ahead": DAYS_AHEAD,
+    }
+
+@app.get("/debug/odds")
+async def debug_odds():
+    if not ODDS_API_KEY:
+        raise HTTPException(status_code=500, detail="ODDS_API_KEY not set")
+    start_iso, end_iso = current_window()
+    results = {}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20, connect=10)) as c:
+        for sk in SPORT_KEYS:
+            url = f"{ODDS_BASE}/sports/{sk}/odds"
+            params = {
+                "regions": "us",
+                "markets": "spreads,totals,h2h",
+                "oddsFormat": "american",
+                "dateFormat": "iso",
+                "commenceTimeFrom": start_iso,
+                "commenceTimeTo":   end_iso,
+                "apiKey": ODDS_API_KEY,
+            }
+            try:
+                r = await c.get(url, params=params)
+                ct = r.headers.get("content-type","")
+                try:
+                    body = r.json()
+                except Exception:
+                    body = r.text[:500]
+                results[sk] = {
+                    "status": r.status_code,
+                    "url": str(r.url),
+                    "count": len(body) if isinstance(body, list) else None,
+                    "sample": body[:1] if isinstance(body, list) else body,
+                    "content_type": ct
+                }
+            except Exception as e:
+                results[sk] = {"error": str(e)}
+    return {"window": {"from": start_iso, "to": end_iso}, "results": results}
