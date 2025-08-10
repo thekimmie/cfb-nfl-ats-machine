@@ -64,7 +64,8 @@ def cache_set(key: str, data: Any):
 
 # ========= Helpers =========
 def iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    # Force UTC, drop microseconds, format exactly YYYY-MM-DDTHH:MM:SSZ
+    return dt.astimezone(timezone.utc).replace(microsecond=0).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 def parse_iso(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
