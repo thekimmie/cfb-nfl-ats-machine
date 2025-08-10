@@ -8,6 +8,11 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+import re  # at the top with imports if not already
+
+def _redact_api_key(url_str: str) -> str:
+    return re.sub(r'(apiKey=)[^&]+', r'\1REDACTED', url_str)
+
 # ========= Env / Config =========
 ODDS_API_KEY   = os.getenv("ODDS_API_KEY")          # The Odds API (official)
 APISPORTS_KEY  = os.getenv("APISPORTS_KEY")         # API-SPORTS (via RapidAPI) for slates/injuries
@@ -426,7 +431,7 @@ async def debug_odds():
                     body = r.text[:500]
                 results[sk] = {
                     "status": r.status_code,
-                    "url": str(r.url),
+                    "url": _redact_api_key(str(r.url)),
                     "count": len(body) if isinstance(body, list) else None,
                     "sample": body[:1] if isinstance(body, list) else body,
                     "content_type": ct
