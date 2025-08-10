@@ -21,6 +21,9 @@ TIO_API_KEY    = os.getenv("TIO_API_KEY")           # Tomorrow.io (Timeline API)
 CACHE_TTL      = int(os.getenv("CACHE_TTL", "600")) # seconds
 CORS_ORIGIN    = [o.strip() for o in os.getenv("CORS_ORIGIN", "*").split(",")]
 LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO")
+HIST_SOURCE = os.getenv("HIST_SOURCE", "none").lower()  # "file" | "url" | "none"
+HIST_PATH   = os.getenv("HIST_PATH")                    # e.g., data/history.csv
+HIST_URL    = os.getenv("HIST_URL")                     # e.g., https://raw.githubusercontent.com/.../history.csv
 
 # Odds window (so we don't get an empty [] on quiet days)
 DAYS_BACK  = int(os.getenv("DAYS_BACK",  "1"))
@@ -99,6 +102,36 @@ def league_label_from_odds_key(sport_key: str) -> Optional[str]:
     if "nfl" in sk: return "NFL"
     if "ncaaf" in sk: return "NCAA"
     return None
+
+import io, csv, json  # (if not already imported)
+
+def _hist_load_from_file(path: str):
+    try:
+        with open(path, "rb") as f:
+            raw = f.read().decode("utf-8", errors="ignore")
+        if path.lower().endswith(".csv"):
+            return [row for row in csv.DictReader(io.StringIO(raw))]
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return [row for row in csv.DictReader(io.StringIO(raw))]
+    except Exception as e:
+        # if you have a logger named `log`, use it; else silence is fine
+        return []
+
+async def _hist_load_from_url(url: str):
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get(url)
+            r.raise_for_status()
+            ct = (r.headers.get("content-type","") or "").lower()
+            if "text/csv" in ct or url.lower().endswith(".csv"):
+                return [row for row in csv.DictReader(io.StringIO(r.text))]
+            data = r.json()
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
 
 PREFERRED_BOOKS = ["pinnacle","circa","bookmaker","draftkings","fanduel","betmgm"]
 def pick_market(bookmakers: List[Dict[str, Any]], key: str):
@@ -386,6 +419,24 @@ async def health():
 @app.get("/version")
 async def version():
     return {"model": "lr_v1", "features": 18, "source": "odds+slate+weather", "ttl_seconds": CACHE_TTL}
+
+async def load_history_rows():
+    cached = cache_get("history_rows")
+    if cached is not None:
+        return cached
+    if HIST_SOURCE == "file" and HIST_PATH:
+        rows = _hist_load_from_file(HIST_PATH)
+    elif HIST_SOURCE == "url" and HIST_URL:
+        rows = await _hist_load_from_url(HIST_URL)
+    else:
+        rows = []
+    cache_set("history_rows", rows)
+    return rows
+
+@app.get("/api/history")
+async def api_history():
+    # returns your historical CSV/JSON as-is
+    return await load_history_rows()
 
 # ---- Debug endpoints ----
 @app.get("/debug/env")
