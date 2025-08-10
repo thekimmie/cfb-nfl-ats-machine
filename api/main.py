@@ -1,95 +1,373 @@
-# api/main.py
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-import os
-import json
-import pickle
-import numpy as np
-import httpx
+import os, asyncio, time, math
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
 
-# ── App setup ───────────────────────────────────────────────────────────────
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+
+# -----------------------------
+# Env / Config
+# -----------------------------
+ODDS_API_KEY   = os.getenv("ODDS_API_KEY")          # The Odds API
+APISPORTS_KEY  = os.getenv("APISPORTS_KEY")         # API-SPORTS (via RapidAPI for American Football)
+CFBD_KEY       = os.getenv("CFBD_KEY")              # CollegeFootballData (for CFB stadiums)
+TIO_API_KEY    = os.getenv("TIO_API_KEY")           # Tomorrow.io Timeline
+CACHE_TTL      = int(os.getenv("CACHE_TTL", "600")) # seconds
+CORS_ORIGIN    = [o.strip() for o in os.getenv("CORS_ORIGIN", "*").split(",")]
+LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO")
+
+# API bases
+ODDS_BASE   = "https://api.the-odds-api.com/v4"
+APISPORTS_HOST = "api-american-football.p.rapidapi.com"   # American Football product on RapidAPI
+APISPORTS_BASE = f"https://{APISPORTS_HOST}"
+CFBD_BASE   = "https://api.collegefootballdata.com"
+TIO_URL     = "https://api.tomorrow.io/v4/timelines"
+
+SPORT_KEYS = ["americanfootball_nfl", "americanfootball_ncaaf"]  # Odds API keys
+
+# -----------------------------
+# App
+# -----------------------------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGIN if CORS_ORIGIN != ["*"] else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/")
-def root():
-    return {"message": "The ATS Model API is live!"}
+# -----------------------------
+# Simple in-memory cache
+# -----------------------------
+_cache: Dict[str, Dict[str, Any]] = {}  # key -> {"ts": epoch, "data": object}
 
+def cache_get(key: str):
+    item = _cache.get(key)
+    if not item: return None
+    if time.time() - item["ts"] > CACHE_TTL:
+        return None
+    return item["data"]
 
-# ── Load model metadata & weights ───────────────────────────────────────────
-META_PATH = os.path.join(os.path.dirname(__file__), "model_metadata.txt")
-with open(META_PATH, "r") as f:
-    meta = json.load(f)
+def cache_set(key: str, data: Any):
+    _cache[key] = {"ts": time.time(), "data": data}
+    return data
 
-FEATURES  = meta["features_used"]
-WEIGHTS   = np.array(meta["weights"])
-INTERCEPT = meta.get("intercept", 0.0)
+# -----------------------------
+# Helpers
+# -----------------------------
+def iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
-# ── Load your trained model ─────────────────────────────────────────────────
-BASE_DIR    = os.path.dirname(__file__)
-PROJECT_DIR = os.path.abspath(os.path.join(BASE_DIR, os.pardir))
-MODEL_PATH  = os.path.join(PROJECT_DIR, "final_ats_model.pkl")
-with open(MODEL_PATH, "rb") as f:
-    model = pickle.load(f)
+def parse_iso(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
 
-# ── RapidAPI config ─────────────────────────────────────────────────────────
-RAPID_KEY = os.getenv("RAPIDAPI_KEY")
-ODDS_HOST = os.getenv("RAPIDAPI_HOST")   # e.g. "americanodds.p.rapidapi.com"
-SPORT     = "ncaaf"                     # or "nfl"
+def nearest_hour_point(points: List[Dict[str, Any]], kickoff_iso: str) -> Optional[Dict[str, Any]]:
+    if not points: return None
+    k = parse_iso(kickoff_iso)
+    best = None
+    best_delta = None
+    for p in points:
+        ts = parse_iso(p["startTime"])
+        d = abs((ts - k).total_seconds())
+        if best is None or d < best_delta:
+            best, best_delta = p, d
+    return best
 
-async def fetch_odds():
-    # use the v4 odds endpoint with required query params for JSON
-    url = f"https://{ODDS_HOST}/v4/sports/{SPORT}/odds?regions=us&markets=spreads"
-    headers = {
-        "X-RapidAPI-Key": RAPID_KEY,
-        "X-RapidAPI-Host": ODDS_HOST
+def compute_weather_alert(values: Dict[str, Any]) -> Optional[bool]:
+    if not values: return None
+    gust = float(values.get("windGust") or 0)
+    precipType = int(values.get("precipitationType") or 0)  # 0=none
+    precipInt = float(values.get("precipitationIntensity") or 0)
+    temp = float(values.get("temperature") or 60)
+    return bool(gust >= 25 or (precipType > 0 and precipInt >= 0.1) or temp <= 20 or temp >= 95)
+
+def league_label_from_odds_key(sport_key: str) -> Optional[str]:
+    if "nfl" in sport_key: return "NFL"
+    if "ncaaf" in sport_key: return "NCAA"
+    return None
+
+# prefer sharper books then retail (tweak order if you like)
+PREFERRED_BOOKS = ["pinnacle","circa","bookmaker","draftkings","fanduel","betmgm"]
+
+def pick_market(bookmakers: List[Dict[str, Any]], key: str):
+    for bk in PREFERRED_BOOKS:
+        b = next((x for x in bookmakers or [] if x.get("key")==bk), None)
+        m = next((m for m in (b.get("markets") or []) if m.get("key")==key), None) if b else None
+        if m: return m, bk
+    # fallback to first
+    if bookmakers:
+        m0 = next((m for m in (bookmakers[0].get("markets") or []) if m.get("key")==key), None)
+        if m0: return m0, bookmakers[0].get("key")
+    return None, None
+
+# -----------------------------
+# Adapters
+# -----------------------------
+async def fetch_odds_for(sport_key: str) -> List[Dict[str, Any]]:
+    if not ODDS_API_KEY:
+        raise HTTPException(status_code=500, detail="ODDS_API_KEY not set")
+    params = {
+        "regions": "us",
+        "markets": "spreads,totals,h2h",
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+        "apiKey": ODDS_API_KEY,
     }
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url, headers=headers)
-        # debug logging
-        print("⚙️  RapidAPI status:", resp.status_code)
-        print("⚙️  RapidAPI body:", resp.text[:200])
-        resp.raise_for_status()
-        return resp.json()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20, connect=10)) as c:
+        r = await c.get(f"{ODDS_BASE}/sports/{sport_key}/odds", params=params)
+        if r.status_code == 429:
+            raise HTTPException(status_code=429, detail="The Odds API rate limit reached")
+        r.raise_for_status()
+        data = r.json()
+        return data if isinstance(data, list) else []
 
-def parse_games(raw):
-    games = []
-    for g in raw:
-        home   = g["home_team"]     if "home_team" in g else g.get("homeTeam")
-        away   = g["away_team"]     if "away_team" in g else g.get("awayTeam")
-        # adjust path if your JSON differs
-        outcome = g["bookmakers"][0]["markets"][0]["outcomes"][0]
-        spread  = float(outcome["point"])
-        games.append({
-            "id":            str(g["id"]),
-            "home_team":     home,
-            "away_team":     away,
-            "commence_time": g["commence_time"] if "commence_time" in g else g.get("commenceTime"),
-            "spread":        spread
-        })
-    return games
+async def fetch_all_odds() -> List[Dict[str, Any]]:
+    tasks = [fetch_odds_for(sk) for sk in SPORT_KEYS]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    out: List[Dict[str, Any]] = []
+    for res in results:
+        if isinstance(res, Exception):
+            # swallow one league failing; log-ish
+            continue
+        out.extend(res)
+    return out
 
-def score(game: dict) -> dict:
-    x = np.array([game.get(f, 0) for f in FEATURES]).reshape(1, -1)
+async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]:
+    """
+    API-SPORTS (American Football) via RapidAPI.
+    Example: GET https://api-american-football.p.rapidapi.com/games?date=YYYY-MM-DD
+    """
+    key = APISPORTS_KEY or os.getenv("RAPIDAPI_KEY")
+    if not key:
+        return []
+    headers = {"X-RapidAPI-Key": key, "X-RapidAPI-Host": APISPORTS_HOST}
+    params = {"date": date_ymd}
+    async with httpx.AsyncClient(timeout=20) as c:
+        r = await c.get(f"{APISPORTS_BASE}/games", headers=headers, params=params)
+        if r.status_code >= 400:
+            return []  # be forgiving; odds-only still works
+        data = r.json().get("response", [])
+        rows = []
+        for g in data:
+            # Normalize a few common fields + try to read venue if included
+            league = (g.get("league") or {}).get("name") or g.get("league")
+            season = (g.get("league") or {}).get("season") or g.get("season")
+            week   = (g.get("week") or {}).get("number") or g.get("week")
+            game_id = g.get("id") or (g.get("game") or {}).get("id") or (g.get("fixture") or {}).get("id")
+            dt = g.get("date") or (g.get("game") or {}).get("date") or (g.get("fixture") or {}).get("date")
+            teams = g.get("teams") or {}
+            home = (teams.get("home") or {}).get("name") or g.get("home")
+            away = (teams.get("away") or {}).get("name") or g.get("away")
+            venue = (g.get("game") or {}).get("venue") or g.get("venue") or {}
+            lat = (venue.get("coordinates") or {}).get("latitude") or venue.get("lat")
+            lon = (venue.get("coordinates") or {}).get("longitude") or venue.get("lon")
+            rows.append({
+                "source": "api-sports",
+                "league": league, "season": season, "week": week,
+                "game_id": game_id, "game_time": dt,
+                "home_team": home, "away_team": away,
+                "venue_lat": lat, "venue_lon": lon,
+            })
+        return rows
+
+async def fetch_cfbd_venues_map() -> Dict[str, Dict[str, Any]]:
+    """
+    CFBD venues (college only) -> map by school/venue name to lat/lon/tz.
+    """
+    cached = cache_get("cfbd_venues")
+    if cached is not None:
+        return cached
+    if not CFBD_KEY:
+        cache_set("cfbd_venues", {})
+        return {}
+    headers = {"Authorization": f"Bearer {CFBD_KEY}"}
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.get(f"{CFBD_BASE}/venues", headers=headers)
+        r.raise_for_status()
+        arr = r.json() if isinstance(r.json(), list) else []
+        m = {}
+        for v in arr:
+            lat, lon = v.get("latitude"), v.get("longitude")
+            tz = v.get("timezone")
+            name = (v.get("name") or "").strip()
+            city = (v.get("city") or "").strip()
+            school = (v.get("school") or "").strip()
+            if lat is None or lon is None: continue
+            entry = {"lat": lat, "lon": lon, "tz": tz, "venue": name, "city": city}
+            if school: m[f"school::{school.lower()}"] = entry
+            if name:   m[f"venue::{name.lower()}"]   = entry
+        cache_set("cfbd_venues", m)
+        return m
+
+async def get_weather_points(lat: float, lon: float, start_iso: str, end_iso: str) -> List[Dict[str, Any]]:
+    if not TIO_API_KEY:
+        return []
+    headers = {"apikey": TIO_API_KEY}
+    body = {
+        "location": f"{lat},{lon}",
+        "fields": ["temperature","windSpeed","windGust","precipitationType",
+                   "precipitationIntensity","humidity","visibility","cloudCover"],
+        "timesteps": ["1h"],
+        "startTime": start_iso, "endTime": end_iso,
+        "units": "imperial"
+    }
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post(TIO_URL, headers=headers, json=body)
+        if r.status_code >= 400:
+            return []
+        data = r.json().get("data", {}).get("timelines", [])
+        hourly = next((x.get("intervals", []) for x in data if x.get("timestep")=="1h"), [])
+        return hourly
+
+# -----------------------------
+# Core: build unified rows
+# -----------------------------
+async def build_rows() -> List[Dict[str, Any]]:
+    # cache top-level result
+    cached = cache_get("model_data_rows")
+    if cached is not None:
+        return cached
+
+    odds = await fetch_all_odds()  # across NFL + NCAAF
+    # Optional: pull slate venue info for the next ~7 days (cheap + helpful)
+    today = datetime.utcnow().date()
+    slate_rows: List[Dict[str, Any]] = []
     try:
-        prob = float(model.predict_proba(x)[0, 1])
+        tasks = [fetch_slates_api_sports_by_date((today + timedelta(days=i)).isoformat()) for i in range(7)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in results:
+            if isinstance(res, list):
+                slate_rows.extend(res)
     except Exception:
-        logit = float(INTERCEPT + np.dot(WEIGHTS, x.flatten()))
-        prob  = 1 / (1 + np.exp(-logit))
-    return {
-        **game,
-        "model_probability": prob,
-        "model_pick":        prob > 0.5
-    }
+        pass
 
+    # index slate by key for venue lookup
+    def key(league: Optional[str], dt_iso: Optional[str], away: Optional[str], home: Optional[str]) -> str:
+        lg = (league or "").strip().upper()
+        iso_dt = ""
+        if dt_iso:
+            try: iso_dt = parse_iso(dt_iso).replace(minute=0, second=0, microsecond=0).isoformat()
+            except Exception: iso_dt = dt_iso
+        a = (away or "").strip().lower().replace(" ", "")
+        h = (home or "").strip().lower().replace(" ", "")
+        return f"{lg}|{iso_dt}|{a}@{h}"
+
+    slate_idx: Dict[str, Dict[str, Any]] = {}
+    for g in slate_rows:
+        slate_idx[key(g.get("league"), g.get("game_time"), g.get("away_team"), g.get("home_team"))] = g
+
+    # CFBD venues for college (fallback if slate lat/lon missing)
+    cfbd_map = await fetch_cfbd_venues_map()
+
+    rows: List[Dict[str, Any]] = []
+    for ev in odds:
+        lg = league_label_from_odds_key(ev.get("sport_key") or ev.get("sport_title", ""))
+        if not lg: continue
+        commence_time = ev.get("commence_time")
+        home = ev.get("home_team")
+        away = ev.get("away_team")
+        k = key(lg, commence_time, away, home)
+
+        # pick markets from preferred books
+        m_spreads, bk_spread = pick_market(ev.get("bookmakers") or [], "spreads")
+        m_totals,  bk_total  = pick_market(ev.get("bookmakers") or [], "totals")
+        m_h2h,     bk_h2h    = pick_market(ev.get("bookmakers") or [], "h2h")
+
+        # outcomes
+        ml_home = next((o for o in (m_h2h or {}).get("outcomes", []) if o.get("name")==home), {})
+        ml_away = next((o for o in (m_h2h or {}).get("outcomes", []) if o.get("name")==away), {})
+        over    = next((o for o in (m_totals or {}).get("outcomes", []) if (o.get("name") or "").lower()=="over"), {})
+        under   = next((o for o in (m_totals or {}).get("outcomes", []) if (o.get("name") or "").lower()=="under"), {})
+        sp_home = next((o for o in (m_spreads or {}).get("outcomes", []) if o.get("name")==home), {})
+        sp_away = next((o for o in (m_spreads or {}).get("outcomes", []) if o.get("name")==away), {})
+
+        row = {
+            "date": commence_time,
+            "league": lg,
+            "season": None, "week": None,
+            "game_id": ev.get("id"),
+            "game_time": commence_time,
+            "away_team": away, "home_team": home,
+
+            # sportsbook values
+            "sportsbook_spread": sp_home.get("point"),
+            "sportsbook_total": over.get("point") or under.get("point"),
+            "sportsbook_ml_odds_home": ml_home.get("price"),
+            "sportsbook_ml_odds_away": ml_away.get("price"),
+            "book_spread": bk_spread, "book_total": bk_total, "book_h2h": bk_h2h,
+
+            # model fields (to be merged later; leave null for now)
+            "model_spread": None,
+            "model_total": None,
+            "model_pick": None,
+            "confidence_pct": None,
+            "edge_vs_line": None,
+            "ou_pick": None,
+            "ou_confidence_pct": None,
+            "total_edge": None,
+            "model_ml_prob_home": None,
+            "model_ml_prob_away": None,
+            "ml_value_flag": None,
+
+            # signals
+            "trap_alert": None,
+            "sharp_flag": None,
+            "weather_alert": None,
+            "volatility_score": None,
+        }
+
+        # enrich season/week if slate had it
+        s = slate_idx.get(k)
+        if s:
+            row["season"] = s.get("season")
+            row["week"]   = s.get("week")
+
+        # ---------- Weather (auto venue resolution) ----------
+        venue_lat = (s or {}).get("venue_lat")
+        venue_lon = (s or {}).get("venue_lon")
+
+        # If NCAA and venue missing, try CFBD by school/home team
+        if not venue_lat or not venue_lon:
+            if lg == "NCAA" and CFBD_KEY:
+                m = cfbd_map.get(f"school::{(home or '').lower()}")
+                if m:
+                    venue_lat, venue_lon = m["lat"], m["lon"]
+
+        # If we found coordinates, call Tomorrow.io around kickoff
+        if venue_lat is not None and venue_lon is not None and commence_time:
+            k_dt = parse_iso(commence_time)
+            win_start = iso((k_dt - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0))
+            win_end   = iso((k_dt + timedelta(hours=2)).replace(minute=0, second=0, microsecond=0))
+            try:
+                pts = await get_weather_points(float(venue_lat), float(venue_lon), win_start, win_end)
+                nearest = nearest_hour_point(pts, commence_time)
+                values = (nearest or {}).get("values", {})
+                row["weather_alert"] = compute_weather_alert(values)
+                # Optional: keep snapshot for your detail drawer
+                row["weather_snapshot"] = values
+            except Exception:
+                # keep going if weather fails
+                pass
+
+        rows.append(row)
+
+    cache_set("model_data_rows", rows)
+    return rows
+
+# -----------------------------
+# Routes
+# -----------------------------
 @app.get("/api/model-data")
 async def model_data():
-    raw_odds = await fetch_odds()
-    games    = parse_games(raw_odds)
-    return [score(g) for g in games]
+    rows = await build_rows()
+    return rows
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "last_sync": cache_get("model_data_rows") is not None}
+
+@app.get("/version")
+async def version():
+    return {"model": "lr_v1", "features": 18, "source": "odds+slate+weather", "ttl_seconds": CACHE_TTL}
