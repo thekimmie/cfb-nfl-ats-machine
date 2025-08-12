@@ -10,6 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import re  # at the top with imports if not already
 
+import io, csv, json
+from pathlib import Path
+
 def _redact_api_key(url_str: str) -> str:
     return re.sub(r'(apiKey=)[^&]+', r'\1REDACTED', url_str)
 
@@ -24,6 +27,7 @@ LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO")
 HIST_SOURCE = os.getenv("HIST_SOURCE", "none").lower()  # "file" | "url" | "none"
 HIST_PATH   = os.getenv("HIST_PATH")                    # e.g., data/history.csv
 HIST_URL    = os.getenv("HIST_URL")                     # e.g., https://raw.githubusercontent.com/.../history.csv
+
 
 # Odds window (so we don't get an empty [] on quiet days)
 DAYS_BACK  = int(os.getenv("DAYS_BACK",  "1"))
@@ -64,6 +68,12 @@ def cache_get(key: str):
 def cache_set(key: str, data: Any):
     _cache[key] = {"ts": time.time(), "data": data}
     return data
+
+def cache_clear(key: str):
+    try:
+        _cache.pop(key, None)
+    except Exception:
+        pass
 
 # ========= Helpers =========
 def iso(dt: datetime) -> str:
@@ -143,6 +153,81 @@ def pick_market(bookmakers: List[Dict[str, Any]], key: str):
         m0 = next((m for m in (bookmakers[0].get("markets") or []) if m.get("key")==key), None)
         if m0: return m0, bookmakers[0].get("key")
     return None, None
+
+def _hist_load_from_file(path: str):
+    try:
+        with open(path, "rb") as f:
+            raw = f.read().decode("utf-8", errors="ignore")
+        if path.lower().endswith(".csv"):
+            return [row for row in csv.DictReader(io.StringIO(raw))]
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return [row for row in csv.DictReader(io.StringIO(raw))]
+    except Exception:
+        return []
+
+async def _hist_load_from_url(url: str):
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get(url)
+            r.raise_for_status()
+            ct = (r.headers.get("content-type","") or "").lower()
+            if "text/csv" in ct or url.lower().endswith(".csv"):
+                return [row for row in csv.DictReader(io.StringIO(r.text))]
+            data = r.json()
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+async def load_history_rows():
+    cached = cache_get("history_rows")
+    if cached is not None:
+        return cached
+    if   HIST_SOURCE == "file" and HIST_PATH:
+        rows = _hist_load_from_file(HIST_PATH)
+    elif HIST_SOURCE == "url"  and HIST_URL:
+        rows = await _hist_load_from_url(HIST_URL)
+    else:
+        rows = []
+    cache_set("history_rows", rows)
+    return rows
+
+@app.get("/api/history")
+async def api_history(refresh: bool = False):
+    if refresh:
+        cache_clear("history_rows")
+    return await load_history_rows()
+
+@app.get("/api/history/debug")
+async def api_history_debug():
+    info = {
+        "HIST_SOURCE": HIST_SOURCE,
+        "HIST_PATH": HIST_PATH,
+        "HIST_URL": HIST_URL,
+        "cwd": os.getcwd(),
+    }
+    try:
+        if HIST_SOURCE == "file" and HIST_PATH:
+            p = Path(HIST_PATH)
+            info["abs_path"]    = str(p.resolve())
+            info["file_exists"] = p.exists()
+            if p.exists():
+                info["file_size"] = p.stat().st_size
+                head = ""
+                try:
+                    with open(p, "rb") as f:
+                        head = f.read(200).decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+                info["file_head"] = head
+        rows = await load_history_rows()
+        info["rows_detected"] = len(rows)
+        info["first_row"]     = rows[0] if rows else None
+    except Exception as e:
+        info["error"] = str(e)
+    return info
 
 # ========= Adapters =========
 async def fetch_odds_for(sport_key: str, start_iso: str, end_iso: str) -> List[Dict[str, Any]]:
