@@ -1,1 +1,6 @@
-
+date,league,season,week,home_team,away_team,model_spread,model_total,model_pick,confidence_pct,edge_vs_line,result,cover_status,closing_line_value
+2024-10-12,NCAA,2024,7,Georgia Bulldogs,Alabama Crimson Tide,-3.2,50.4,Georgia -6.5,84.2,3.3,home_win,cover,1.5
+2024-10-12,NCAA,2024,7,Texas Longhorns,LSU Tigers,-1.7,55.2,Texas -2.5,71.0,0.8,home_loss,no_cover,-0.5
+2024-11-03,NFL,2024,9,Philadelphia Eagles,Dallas Cowboys,-4.1,46.0,Eagles -3,77.5,1.1,home_win,cover,0.5
+2024-11-10,NFL,2024,10,Seattle Seahawks,San Francisco 49ers,2.2,44.5,Seahawks +3,65.0,0.8,home_loss,cover,0.3
+2024-11-17,NFL,2024,11,Kansas City Chiefs,Los Angeles Chargers,-6.0,49.5,Chiefs -5.5,81.0,-0.5,home_win,cover,0.2
