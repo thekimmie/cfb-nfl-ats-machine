@@ -1,6 +1,6 @@
 # main.py — Betting Machine API (FastAPI on Render)
 
-import os, re, io, csv, json, time, logging, asyncio, importlib.util
+import os, re, io, csv, json, time, logging, asyncio, importlib.util, sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
@@ -18,15 +18,16 @@ CACHE_TTL      = int(os.getenv("CACHE_TTL", "600"))         # seconds
 CORS_ORIGIN    = [o.strip() for o in os.getenv("CORS_ORIGIN", "*").split(",")]
 LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO")
 
-# History passthrough
+# Optional: historical data passthrough (CSV/JSON)
 HIST_SOURCE = os.getenv("HIST_SOURCE", "none").lower()      # "file" | "url" | "none"
 HIST_PATH   = os.getenv("HIST_PATH")                        # e.g. data/history.csv
 HIST_URL    = os.getenv("HIST_URL")                         # e.g. https://raw.githubusercontent.com/.../history.csv
 
-# Model integration
+# Optional: model output (CSV/JSON) to merge into rows
 MODEL_SOURCE = os.getenv("MODEL_SOURCE", "none").lower()    # "file" | "url" | "script" | "none"
-MODEL_PATH   = os.getenv("MODEL_PATH")                      # e.g. data/model_output.csv / .json / predict.py
+MODEL_PATH   = os.getenv("MODEL_PATH")                      # e.g. data/model_output.csv / .json OR ./predict.py for script mode
 MODEL_URL    = os.getenv("MODEL_URL")                       # e.g. https://raw.githubusercontent.com/.../model_output.json
+MODEL_WEIGHTS_PATH = os.getenv("MODEL_WEIGHTS_PATH")        # path to .pkl if your script uses it
 
 # Odds window
 DAYS_BACK  = int(os.getenv("DAYS_BACK",  "1"))
@@ -173,10 +174,10 @@ def synth_row_key(league: Optional[str], game_time: Optional[str], away: Optiona
 # ---- Type coercion for model fields ----
 NUM_FIELDS = [
     "model_spread","model_total","confidence_pct","ou_confidence_pct",
-    "model_ml_prob_home","model_ml_prob_away","volatility_score","edge_vs_line","total_edge"
+    "model_ml_prob_home","model_ml_prob_away","volatility_score",
+    "edge_vs_line","total_edge"
 ]
 BOOL_FIELDS = ["ml_value_flag","trap_alert","sharp_flag","weather_alert"]
-STR_FIELDS  = ["model_pick","ou_pick"]
 
 def _to_boolish(v):
     if isinstance(v, bool): return v
@@ -187,16 +188,10 @@ def _to_boolish(v):
     return None
 
 def coerce_types(row: Dict[str, Any]):
-    # blanks -> None
-    for f in NUM_FIELDS + BOOL_FIELDS + STR_FIELDS:
-        if f in row and (row[f] == "" or (isinstance(row[f], str) and row[f].strip() == "")):
-            row[f] = None
-    # numbers
     for f in NUM_FIELDS:
         if f in row and row[f] is not None:
             try: row[f] = float(row[f])
             except: pass
-    # booleans
     for f in BOOL_FIELDS:
         if f in row:
             row[f] = _to_boolish(row[f])
@@ -241,7 +236,7 @@ async def load_history_rows():
     cache_set("history_rows", rows)
     return rows
 
-# -------------------- Model loader (file/url) --------------------
+# -------------------- Model loader (CSV/JSON merge mode) --------------------
 async def _model_load_from_url(url: str):
     try:
         async with httpx.AsyncClient(timeout=30) as c:
@@ -283,14 +278,19 @@ def _coerce_iso(s: Optional[str]) -> Optional[str]:
         except Exception:
             return s
 
-async def load_model_rows_file_or_url():
+async def load_model_rows():
+    """Load precomputed model outputs (CSV/JSON) if MODEL_SOURCE is file/url."""
+    cached = cache_get("model_rows")
+    if cached is not None:
+        return cached
+
     if   MODEL_SOURCE == "file" and MODEL_PATH:
         rows = _model_load_from_file(MODEL_PATH)
     elif MODEL_SOURCE == "url"  and MODEL_URL:
         rows = await _model_load_from_url(MODEL_URL)
     else:
         rows = []
-    # normalize
+
     normed = []
     for r in rows:
         league = _norm_league(r.get("league") or r.get("League"))
@@ -300,59 +300,43 @@ async def load_model_rows_file_or_url():
         away = _norm_team(r.get("away_team") or r.get("Away") or r.get("away"))
         if not (league and game_time and home and away):
             continue
-        rr = {**r, "league": league, "game_time": game_time, "home_team": home, "away_team": away}
-        coerce_types(rr)
-        normed.append(rr)
+        # Coerce types in-place so we don't merge strings later
+        for f in NUM_FIELDS:
+            if f in r and r[f] is not None:
+                try: r[f] = float(r[f])
+                except: pass
+        for f in BOOL_FIELDS:
+            if f in r:
+                r[f] = _to_boolish(r[f])
+        normed.append({**r, "league": league, "game_time": game_time, "home_team": home, "away_team": away})
+
+    cache_set("model_rows", normed)
     return normed
 
-# -------------------- Script model integration --------------------
-_script_mod = None
-def _load_script_module(path: str):
-    global _script_mod
-    if _script_mod is not None:
-        return _script_mod
-    p = Path(path)
-    if not p.exists():
-        raise HTTPException(status_code=500, detail=f"MODEL_PATH not found: {path}")
-    spec = importlib.util.spec_from_file_location("bm_predict_script", str(p))
-    mod = importlib.util.module_from_spec(spec)  # type: ignore
-    assert spec.loader
-    spec.loader.exec_module(mod)  # type: ignore
-    _script_mod = mod
-    return mod
+# -------------------- Script Model loader (predict.py) --------------------
+_predict_module = None
 
-def _script_predict_games(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Calls predict.py: must expose def predict_games(games) -> list[dict]
-    Each returned dict must include league, game_time, home_team, away_team plus any model fields.
-    """
-    mod = _load_script_module(MODEL_PATH)
-    if not hasattr(mod, "predict_games"):
-        raise HTTPException(status_code=500, detail="predict.py is missing predict_games(games) function")
-    # Provide a minimal, stable game schema as input
-    games_in = []
-    for r in rows:
-        games_in.append({
-            "league": r.get("league"),
-            "game_time": r.get("game_time"),
-            "home_team": r.get("home_team"),
-            "away_team": r.get("away_team"),
-            "sportsbook_spread": r.get("sportsbook_spread"),
-            "sportsbook_total":  r.get("sportsbook_total"),
-            "sportsbook_ml_odds_home": r.get("sportsbook_ml_odds_home"),
-            "sportsbook_ml_odds_away": r.get("sportsbook_ml_odds_away"),
-        })
-    preds = mod.predict_games(games_in)  # may be sync
-    if not isinstance(preds, list):
-        raise HTTPException(status_code=500, detail="predict_games must return a list[dict]")
-    out = []
-    for p in preds:
-        if not isinstance(p, dict): 
-            continue
-        # normalize/coerce
-        coerce_types(p)
-        out.append(p)
-    return out
+def get_predict_module():
+    """Dynamically import the user's predict.py when MODEL_SOURCE=script."""
+    global _predict_module
+    if _predict_module is not None:
+        return _predict_module
+    if MODEL_SOURCE != "script" or not MODEL_PATH:
+        _predict_module = None
+        return None
+    spec = importlib.util.spec_from_file_location("user_predict", MODEL_PATH)
+    if spec is None or spec.loader is None:
+        _predict_module = None
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        log.error("Failed to import predict script at %s: %s", MODEL_PATH, e)
+        _predict_module = None
+        return None
+    _predict_module = mod
+    return mod
 
 # -------------------- Odds / Slates / Weather adapters --------------------
 PREFERRED_BOOKS = ["pinnacle","circa","bookmaker","draftkings","fanduel","betmgm"]
@@ -409,6 +393,11 @@ async def fetch_all_odds() -> List[Dict[str, Any]]:
     return out
 
 async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]:
+    """
+    API-SPORTS (American Football) via RapidAPI.
+    GET https://api-american-football.p.rapidapi.com/games?date=YYYY-MM-DD
+    Normalizes date to ISO string so our join_key matches Odds API commence_time.
+    """
     def _flatten_dt(raw):
         if not raw:
             return None
@@ -449,7 +438,6 @@ async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]
             league = (g.get("league") or {}).get("name") or g.get("league")
             season = (g.get("league") or {}).get("season") or g.get("season")
             week   = (g.get("week") or {}).get("number") or g.get("week")
-
             raw_dt = g.get("date") or (g.get("game") or {}).get("date") or (g.get("fixture") or {}).get("date")
             dt_iso = _flatten_dt(raw_dt)
 
@@ -518,10 +506,10 @@ async def get_weather_points(lat: float, lon: float, start_iso: str, end_iso: st
         hourly = next((x.get("intervals", []) for x in data if x.get("timestep")=="1h"), [])
         return hourly
 
-# -------------------- Core: build unified rows --------------------
 def pick_outcome(market: Optional[Dict[str, Any]], name: str) -> Dict[str, Any]:
     return next((o for o in (market or {}).get("outcomes", []) if o.get("name")==name), {})
 
+# -------------------- Core: build unified rows --------------------
 async def build_rows() -> List[Dict[str, Any]]:
     cached = cache_get("model_data_rows")
     if cached is not None:
@@ -546,10 +534,16 @@ async def build_rows() -> List[Dict[str, Any]]:
         for g in slate_rows
     }
 
-    # 3) CFBD venues (NCAA fallback)
+    # 3) Model rows (precomputed CSV/JSON) if configured
+    model_rows = await load_model_rows() if MODEL_SOURCE in ("file","url") else []
+    model_idx = {
+        join_key(m.get("league"), m.get("game_time"), m.get("away_team"), m.get("home_team")): m
+        for m in model_rows
+    }
+
+    # 4) CFBD venues (NCAA fallback)
     cfbd_map = await fetch_cfbd_venues_map()
 
-    # 4) Build base rows (odds + optional slate/venue + weather)
     rows: List[Dict[str, Any]] = []
     for ev in odds:
         lg = league_label_from_odds_key(ev.get("sport_key") or ev.get("sport_title", ""))
@@ -586,7 +580,7 @@ async def build_rows() -> List[Dict[str, Any]]:
             "sportsbook_ml_odds_away": ml_away.get("price"),
             "book_spread": bk_spread, "book_total": bk_total, "book_h2h": bk_h2h,
 
-            # model fields (to fill)
+            # model fields (populated from model file or script)
             "model_spread": None, "model_total": None, "model_pick": None,
             "confidence_pct": None, "edge_vs_line": None,
             "ou_pick": None, "ou_confidence_pct": None, "total_edge": None,
@@ -602,6 +596,30 @@ async def build_rows() -> List[Dict[str, Any]]:
         if s:
             row["season"] = s.get("season")
             row["week"]   = s.get("week")
+
+        # merge precomputed model fields (if any)
+        m = model_idx.get(k)
+        if m:
+            for fld in [
+                "model_spread","model_total","model_pick","confidence_pct","edge_vs_line",
+                "ou_pick","ou_confidence_pct","total_edge",
+                "model_ml_prob_home","model_ml_prob_away","ml_value_flag",
+                "trap_alert","sharp_flag","volatility_score"
+            ]:
+                if m.get(fld) is not None and m.get(fld) != "":
+                    row[fld] = m[fld]
+
+        # compute edges if inputs exist and model didn't provide them
+        try:
+            if row.get("model_spread") is not None and row.get("sportsbook_spread") is not None and row.get("edge_vs_line") is None:
+                row["edge_vs_line"] = float(row["model_spread"]) - float(row["sportsbook_spread"])
+        except Exception:
+            pass
+        try:
+            if row.get("model_total") is not None and row.get("sportsbook_total") is not None and row.get("total_edge") is None:
+                row["total_edge"] = float(row["model_total"]) - float(row["sportsbook_total"])
+        except Exception:
+            pass
 
         # ---------- Weather (venue resolution) ----------
         venue_lat = (s or {}).get("venue_lat")
@@ -619,6 +637,7 @@ async def build_rows() -> List[Dict[str, Any]]:
             if st:
                 venue_lat, venue_lon = st["lat"], st["lon"]
 
+        # if we have coords + kickoff, pull a timeline slice and compute alert
         if venue_lat is not None and venue_lon is not None and commence_time:
             k_dt = parse_iso(commence_time)
             win_start = iso((k_dt - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0))
@@ -635,61 +654,61 @@ async def build_rows() -> List[Dict[str, Any]]:
         # stable primary key for Retool tables
         row["row_key"] = row.get("game_id") or synth_row_key(lg, commence_time, away, home)
 
+        # Finally, coerce types in case upstream gave strings
+        coerce_types(row)
+
         rows.append(row)
 
-    # 5) Apply model (file/url OR script)
-    if MODEL_SOURCE in ("file", "url"):
-        model_rows = await load_model_rows_file_or_url()
-        model_idx = { join_key(m.get("league"), m.get("game_time"), m.get("away_team"), m.get("home_team")): m
-                      for m in model_rows }
-        for r in rows:
-            k = join_key(r.get("league"), r.get("game_time"), r.get("away_team"), r.get("home_team"))
-            m = model_idx.get(k)
-            if m:
-                for fld in [
-                    "model_spread","model_total","model_pick","confidence_pct","edge_vs_line",
-                    "ou_pick","ou_confidence_pct","total_edge",
-                    "model_ml_prob_home","model_ml_prob_away","ml_value_flag",
-                    "trap_alert","sharp_flag","volatility_score","weather_alert"
-                ]:
-                    if m.get(fld) is not None:
-                        r[fld] = m[fld]
-    elif MODEL_SOURCE == "script" and MODEL_PATH:
+    # --- Run script model if available (MODEL_SOURCE=script) ---
+    pm = get_predict_module()
+    if pm and hasattr(pm, "predict_games"):
         try:
-            preds = _script_predict_games(rows)
-            pred_idx = { join_key(p.get("league"), p.get("game_time"), p.get("away_team"), p.get("home_team")): p
-                         for p in preds }
-            for r in rows:
-                k = join_key(r.get("league"), r.get("game_time"), r.get("away_team"), r.get("home_team"))
-                p = pred_idx.get(k)
-                if p:
-                    for fld in [
-                        "model_spread","model_total","model_pick","confidence_pct","edge_vs_line",
-                        "ou_pick","ou_confidence_pct","total_edge",
-                        "model_ml_prob_home","model_ml_prob_away","ml_value_flag",
-                        "trap_alert","sharp_flag","volatility_score"
-                    ]:
-                        if p.get(fld) is not None:
-                            r[fld] = p[fld]
-        except HTTPException:
-            raise
-        except Exception as e:
-            log.exception("Model script failed: %s", e)
-            # keep going with odds-only rows
+            inputs = [{
+                "league": r.get("league"),
+                "game_time": r.get("game_time"),
+                "home_team": r.get("home_team"),
+                "away_team": r.get("away_team"),
+                "sportsbook_spread": r.get("sportsbook_spread"),
+                "sportsbook_total": r.get("sportsbook_total"),
+                "sportsbook_ml_odds_home": r.get("sportsbook_ml_odds_home"),
+                "sportsbook_ml_odds_away": r.get("sportsbook_ml_odds_away"),
+            } for r in rows]
 
-    # 6) compute edges if still missing
-    for r in rows:
-        coerce_types(r)
-        try:
-            if r.get("edge_vs_line") is None and r.get("model_spread") is not None and r.get("sportsbook_spread") is not None:
-                r["edge_vs_line"] = float(r["model_spread"]) - float(r["sportsbook_spread"])
-        except Exception:
-            pass
-        try:
-            if r.get("total_edge") is None and r.get("model_total") is not None and r.get("sportsbook_total") is not None:
-                r["total_edge"] = float(r["model_total"]) - float(r["sportsbook_total"])
-        except Exception:
-            pass
+            preds = pm.predict_games(inputs) or []
+            pred_idx = {
+                join_key(p.get("league"), p.get("game_time"), p.get("away_team"), p.get("home_team")): p
+                for p in preds if p.get("league") and p.get("game_time")
+            }
+
+            for r in rows:
+                pk = join_key(r.get("league"), r.get("game_time"), r.get("away_team"), r.get("home_team"))
+                p = pred_idx.get(pk)
+                if not p:
+                    continue
+                for fld in [
+                    "model_ml_prob_home","model_ml_prob_away","model_pick","confidence_pct","ml_value_flag",
+                    "model_spread","model_total","edge_vs_line","ou_pick","ou_confidence_pct","total_edge",
+                    "trap_alert","sharp_flag","volatility_score"
+                ]:
+                    if fld in p and p[fld] is not None and p[fld] != "":
+                        r[fld] = p[fld]
+                # Re-coerce after merge
+                coerce_types(r)
+
+                # fill edges if still missing
+                try:
+                    if r.get("model_spread") is not None and r.get("sportsbook_spread") is not None and r.get("edge_vs_line") is None:
+                        r["edge_vs_line"] = float(r["model_spread"]) - float(r["sportsbook_spread"])
+                except Exception:
+                    pass
+                try:
+                    if r.get("model_total") is not None and r.get("sportsbook_total") is not None and r.get("total_edge") is None:
+                        r["total_edge"] = float(r["model_total"]) - float(r["sportsbook_total"])
+                except Exception:
+                    pass
+
+        except Exception as e:
+            log.error("predict_games failed: %s", e)
 
     cache_set("model_data_rows", rows)
     return rows
@@ -700,7 +719,9 @@ async def root():
     start_iso, end_iso = current_window()
     return {
         "ok": True,
-        "endpoints": ["/health", "/version", "/api/model-data", "/api/history", "/api/model/debug", "/debug/env", "/debug/odds", "/debug/slates", "/debug/coverage", "/debug/model-script"],
+        "endpoints": ["/health", "/version", "/api/model-data", "/api/history",
+                      "/api/model/debug", "/debug/env", "/debug/odds", "/debug/slates",
+                      "/debug/coverage", "/debug/model-script"],
         "window": {"from": start_iso, "to": end_iso}
     }
 
@@ -718,27 +739,23 @@ async def api_history(refresh: bool = False):
 
 @app.get("/api/model/debug")
 async def api_model_debug():
-    info = {
+    rows = await load_model_rows() if MODEL_SOURCE in ("file","url") else []
+    return {
         "MODEL_SOURCE": MODEL_SOURCE,
         "MODEL_PATH": MODEL_PATH,
         "MODEL_URL": MODEL_URL,
+        "rows_detected": len(rows),
+        "first_row": rows[0] if rows else None
     }
-    if MODEL_SOURCE in ("file","url"):
-        rows = await load_model_rows_file_or_url()
-        info["rows_detected"] = len(rows)
-        info["first_row"] = rows[0] if rows else None
-    return info
 
 @app.get("/debug/model-script")
 def debug_model_script():
-    if MODEL_SOURCE != "script":
-        return {"enabled": False, "reason": "MODEL_SOURCE != 'script'"}
-    try:
-        mod = _load_script_module(MODEL_PATH)
-        has_func = hasattr(mod, "predict_games")
-        return {"enabled": True, "module": str(MODEL_PATH), "has_predict_games": has_func}
-    except Exception as e:
-        return {"enabled": True, "error": str(e)}
+    pm = get_predict_module()
+    return {
+        "enabled": MODEL_SOURCE == "script",
+        "path": MODEL_PATH,
+        "has_predict_games": bool(pm and hasattr(pm, "predict_games"))
+    }
 
 @app.get("/debug/env")
 def debug_env():
@@ -758,6 +775,7 @@ def debug_env():
         "model_source": MODEL_SOURCE,
         "model_path": MODEL_PATH,
         "model_url": MODEL_URL,
+        "model_weights_path": MODEL_WEIGHTS_PATH,
     }
 
 @app.get("/debug/odds")
@@ -814,12 +832,15 @@ async def debug_slates():
         "sample_with_coords": with_coords[:3]
     }
 
-# Model coverage: how many odds rows matched a model row
+# Model coverage: how many odds rows matched a model row OR script prediction
 @app.get("/debug/coverage")
 async def debug_coverage():
     rows = await build_rows()
     total = len(rows)
-    with_model = sum(1 for r in rows if r.get("model_spread") is not None or r.get("model_total") is not None or (r.get("model_pick") not in (None, "")))
+    with_model = sum(
+        1 for r in rows
+        if any(r.get(f) not in (None, "") for f in ["model_spread","model_total","model_pick","model_ml_prob_home","model_ml_prob_away"])
+    )
     return {"total_rows": total, "rows_with_any_model_field": with_model}
 
 @app.post("/admin/refresh")
@@ -833,4 +854,4 @@ async def health():
 
 @app.get("/version")
 async def version():
-    return {"model": "lr_v1", "features": 18, "source": f"odds+slate+weather+{MODEL_SOURCE}", "ttl_seconds": CACHE_TTL}
+    return {"model": "rf_script_or_file", "features": 18, "source": "odds+slate+weather+model", "ttl_seconds": CACHE_TTL}
