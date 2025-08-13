@@ -170,11 +170,29 @@ def synth_row_key(league: Optional[str], game_time: Optional[str], away: Optiona
     h = (home or "").lower().replace(" ", "")
     return f"{lg}|{iso_dt}|{a}@{h}"
 
-def implied_prob(american):
-    if american is None:
-        return None
-    x = float(american)
-    return 100.0/(x+100.0) if x > 0 else (-x)/((-x)+100.0)
+# ---- Type coercion for model fields ----
+NUM_FIELDS = [
+    "model_spread","model_total","confidence_pct","ou_confidence_pct",
+    "model_ml_prob_home","model_ml_prob_away","volatility_score"
+]
+BOOL_FIELDS = ["ml_value_flag","trap_alert","sharp_flag","weather_alert"]
+
+def _to_boolish(v):
+    if isinstance(v, bool): return v
+    if v is None: return None
+    s = str(v).strip().lower()
+    if s in ("true","1","yes","y"): return True
+    if s in ("false","0","no","n"): return False
+    return None
+
+def coerce_types(row: Dict[str, Any]):
+    for f in NUM_FIELDS:
+        if f in row and row[f] is not None:
+            try: row[f] = float(row[f])
+            except: pass
+    for f in BOOL_FIELDS:
+        if f in row:
+            row[f] = _to_boolish(row[f])
 
 # -------------------- History loader (optional) --------------------
 def _csv_to_dicts(text: str) -> List[Dict[str, Any]]:
@@ -345,6 +363,7 @@ async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]
     Normalizes date to ISO string so our join_key matches Odds API commence_time.
     """
     def _flatten_dt(raw):
+        # raw might be str, or dict {timezone,date,time,timestamp}
         if not raw:
             return None
         if isinstance(raw, str):
@@ -384,15 +403,20 @@ async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]
             league = (g.get("league") or {}).get("name") or g.get("league")
             season = (g.get("league") or {}).get("season") or g.get("season")
             week   = (g.get("week") or {}).get("number") or g.get("week")
+
             raw_dt = g.get("date") or (g.get("game") or {}).get("date") or (g.get("fixture") or {}).get("date")
             dt_iso = _flatten_dt(raw_dt)
+
             teams = g.get("teams") or {}
             home = (teams.get("home") or {}).get("name") or g.get("home")
             away = (teams.get("away") or {}).get("name") or g.get("away")
+
             venue = (g.get("game") or {}).get("venue") or g.get("venue") or {}
             lat = (venue.get("coordinates") or {}).get("latitude") or venue.get("lat")
             lon = (venue.get("coordinates") or {}).get("longitude") or venue.get("lon")
+
             game_id = g.get("id") or (g.get("game") or {}).get("id") or (g.get("fixture") or {}).get("id")
+
             rows.append({
                 "source": "api-sports",
                 "league": league, "season": season, "week": week,
@@ -414,7 +438,7 @@ async def fetch_cfbd_venues_map() -> Dict[str, Dict[str, Any]]:
         r = await c.get(f"{CFBD_BASE}/venues", headers=headers)
         r.raise_for_status()
         arr = r.json() if isinstance(r.json(), list) else []
-        m: Dict[str, Dict[str, Any]] = {}
+        m = {}
         for v in arr:
             lat, lon = v.get("latitude"), v.get("longitude")
             tz = v.get("timezone")
@@ -449,6 +473,9 @@ async def get_weather_points(lat: float, lon: float, start_iso: str, end_iso: st
         return hourly
 
 # -------------------- Core: build unified rows --------------------
+def pick_outcome(market: Optional[Dict[str, Any]], name: str) -> Dict[str, Any]:
+    return next((o for o in (market or {}).get("outcomes", []) if o.get("name")==name), {})
+
 async def build_rows() -> List[Dict[str, Any]]:
     cached = cache_get("model_data_rows")
     if cached is not None:
@@ -498,12 +525,12 @@ async def build_rows() -> List[Dict[str, Any]]:
         m_totals,  bk_total  = pick_market(ev.get("bookmakers") or [], "totals")
         m_h2h,     bk_h2h    = pick_market(ev.get("bookmakers") or [], "h2h")
 
-        # outcomes (use home entries for spread; totals use over/under)
-        ml_home = next((o for o in (m_h2h or {}).get("outcomes", []) if o.get("name")==home), {})
-        ml_away = next((o for o in (m_h2h or {}).get("outcomes", []) if o.get("name")==away), {})
+        # outcomes
+        ml_home = pick_outcome(m_h2h, home)
+        ml_away = pick_outcome(m_h2h, away)
         over    = next((o for o in (m_totals or {}).get("outcomes", []) if (o.get("name") or "").lower()=="over"), {})
         under   = next((o for o in (m_totals or {}).get("outcomes", []) if (o.get("name") or "").lower()=="under"), {})
-        sp_home = next((o for o in (m_spreads or {}).get("outcomes", []) if o.get("name")==home), {})
+        sp_home = pick_outcome(m_spreads, home)
 
         row: Dict[str, Any] = {
             "date": commence_time,
@@ -548,46 +575,35 @@ async def build_rows() -> List[Dict[str, Any]]:
                 if m.get(fld) is not None:
                     row[fld] = m[fld]
 
-        # compute/override edges and picks for consistency
+        # compute edges if inputs exist and model didn't provide them
         try:
-            if row.get("model_spread") is not None and row.get("sportsbook_spread") is not None:
-                row["edge_vs_line"] = float(row.get("edge_vs_line") or 0.0)
+            if row.get("model_spread") is not None and row.get("sportsbook_spread") is not None and row.get("edge_vs_line") is None:
                 row["edge_vs_line"] = float(row["model_spread"]) - float(row["sportsbook_spread"])
         except Exception:
             pass
         try:
-            if row.get("model_total") is not None and row.get("sportsbook_total") is not None:
-                row["total_edge"] = float(row.get("total_edge") or 0.0)
+            if row.get("model_total") is not None and row.get("sportsbook_total") is not None and row.get("total_edge") is None:
                 row["total_edge"] = float(row["model_total"]) - float(row["sportsbook_total"])
-                # Derive OU pick if missing or inconsistent
-                want_over = float(row["model_total"]) > float(row["sportsbook_total"])
-                pick_text = f"{'Over' if want_over else 'Under'} {row['sportsbook_total']}"
-                if (row.get("ou_pick") is None) or (("Over" in str(row["ou_pick"])) != want_over):
-                    row["ou_pick"] = pick_text
         except Exception:
             pass
 
-        # ML value flag based on model prob vs implied
-        try:
-            if row.get("model_ml_prob_home") is not None and row.get("sportsbook_ml_odds_home") is not None:
-                imp = implied_prob(row["sportsbook_ml_odds_home"])
-                if imp is not None:
-                    row["ml_value_flag"] = float(row["model_ml_prob_home"]) > float(imp)
-        except Exception:
-            pass
-
-        # weather (venue from slate; NCAA fallback via CFBD school; NFL fallback via stadium map)
+        # ---------- Weather (venue resolution) ----------
         venue_lat = (s or {}).get("venue_lat")
         venue_lon = (s or {}).get("venue_lon")
+
+        # NCAA fallback via CFBD school mapping
         if (venue_lat is None or venue_lon is None) and lg == "NCAA" and CFBD_KEY:
             m_school = cfbd_map.get(f"school::{(home or '').lower()}")
             if m_school:
                 venue_lat, venue_lon = m_school["lat"], m_school["lon"]
+
+        # NFL fallback via static stadium map
         if (venue_lat is None or venue_lon is None) and lg == "NFL":
             st = NFL_STADIUMS.get(home or "")
             if st:
                 venue_lat, venue_lon = st["lat"], st["lon"]
 
+        # if we have coords + kickoff, pull a timeline slice and compute alert
         if venue_lat is not None and venue_lon is not None and commence_time:
             k_dt = parse_iso(commence_time)
             win_start = iso((k_dt - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0))
@@ -603,6 +619,10 @@ async def build_rows() -> List[Dict[str, Any]]:
 
         # stable primary key for Retool tables
         row["row_key"] = row.get("game_id") or synth_row_key(lg, commence_time, away, home)
+
+        # make sure types are clean (model files often ship numbers as strings)
+        coerce_types(row)
+
         rows.append(row)
 
     cache_set("model_data_rows", rows)
@@ -614,7 +634,7 @@ async def root():
     start_iso, end_iso = current_window()
     return {
         "ok": True,
-        "endpoints": ["/health", "/version", "/api/model-data", "/api/history", "/api/model/debug", "/debug/env", "/debug/odds", "/debug/slates", "/admin/refresh"],
+        "endpoints": ["/health", "/version", "/api/model-data", "/api/history", "/api/model/debug", "/debug/env", "/debug/odds", "/debug/slates", "/debug/coverage"],
         "window": {"from": start_iso, "to": end_iso}
     }
 
@@ -694,6 +714,7 @@ async def debug_odds():
                 results[sk] = {"error": str(e)}
     return {"window": {"from": start_iso, "to": end_iso}, "results": results}
 
+# Show next 14 days of slates from API-SPORTS and how many have venue coords
 @app.get("/debug/slates")
 async def debug_slates():
     today = datetime.utcnow().date()
@@ -710,6 +731,14 @@ async def debug_slates():
         "sample": rows[:3],
         "sample_with_coords": with_coords[:3]
     }
+
+# Model coverage: how many odds rows matched a model row
+@app.get("/debug/coverage")
+async def debug_coverage():
+    rows = await build_rows()
+    total = len(rows)
+    with_model = sum(1 for r in rows if r.get("model_spread") is not None or r.get("model_total") is not None or r.get("model_pick") not in (None, ""))
+    return {"total_rows": total, "rows_with_any_model_field": with_model}
 
 @app.post("/admin/refresh")
 def admin_refresh():
