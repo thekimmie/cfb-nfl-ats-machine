@@ -1,6 +1,7 @@
-# main.py  (repo root)
+# main.py  — Betting Machine API (FastAPI on Render)
 
-import os, asyncio, time, logging
+import os, re, io, csv, json, time, logging, asyncio
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
 
@@ -8,28 +9,26 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-import re  # at the top with imports if not already
-
-import io, csv, json
-from pathlib import Path
-
-def _redact_api_key(url_str: str) -> str:
-    return re.sub(r'(apiKey=)[^&]+', r'\1REDACTED', url_str)
-
-# ========= Env / Config =========
-ODDS_API_KEY   = os.getenv("ODDS_API_KEY")          # The Odds API (official)
-APISPORTS_KEY  = os.getenv("APISPORTS_KEY")         # API-SPORTS (via RapidAPI) for slates/injuries
-CFBD_KEY       = os.getenv("CFBD_KEY")              # CollegeFootballData (CFB venues fallback)
-TIO_API_KEY    = os.getenv("TIO_API_KEY")           # Tomorrow.io (Timeline API)
-CACHE_TTL      = int(os.getenv("CACHE_TTL", "600")) # seconds
+# -------------------- Config / Env --------------------
+ODDS_API_KEY   = os.getenv("ODDS_API_KEY")                  # The Odds API
+APISPORTS_KEY  = os.getenv("APISPORTS_KEY")                 # API-SPORTS (RapidAPI) for slates/injuries
+CFBD_KEY       = os.getenv("CFBD_KEY")                      # CollegeFootballData (CFB venues)
+TIO_API_KEY    = os.getenv("TIO_API_KEY")                   # Tomorrow.io Timeline
+CACHE_TTL      = int(os.getenv("CACHE_TTL", "600"))         # seconds
 CORS_ORIGIN    = [o.strip() for o in os.getenv("CORS_ORIGIN", "*").split(",")]
 LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO")
-HIST_SOURCE = os.getenv("HIST_SOURCE", "none").lower()  # "file" | "url" | "none"
-HIST_PATH   = os.getenv("HIST_PATH")                    # e.g., data/history.csv
-HIST_URL    = os.getenv("HIST_URL")                     # e.g., https://raw.githubusercontent.com/.../history.csv
 
+# Optional: historical data passthrough (CSV/JSON)
+HIST_SOURCE = os.getenv("HIST_SOURCE", "none").lower()      # "file" | "url" | "none"
+HIST_PATH   = os.getenv("HIST_PATH")                        # e.g. data/history.csv
+HIST_URL    = os.getenv("HIST_URL")                         # e.g. https://raw.githubusercontent.com/.../history.csv
 
-# Odds window (so we don't get an empty [] on quiet days)
+# Optional: model output (CSV/JSON) to merge into rows
+MODEL_SOURCE = os.getenv("MODEL_SOURCE", "none").lower()    # "file" | "url" | "none"
+MODEL_PATH   = os.getenv("MODEL_PATH")                      # e.g. data/model_output.csv / .json
+MODEL_URL    = os.getenv("MODEL_URL")                       # e.g. https://raw.githubusercontent.com/.../model_output.json
+
+# Odds window
 DAYS_BACK  = int(os.getenv("DAYS_BACK",  "1"))
 DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "14"))
 
@@ -40,9 +39,9 @@ APISPORTS_BASE  = f"https://{APISPORTS_HOST}"
 CFBD_BASE       = "https://api.collegefootballdata.com"
 TIO_URL         = "https://api.tomorrow.io/v4/timelines"
 
-SPORT_KEYS = ["americanfootball_nfl", "americanfootball_ncaaf"]  # Odds API sport keys
+SPORT_KEYS = ["americanfootball_nfl", "americanfootball_ncaaf"]
 
-# ========= App =========
+# -------------------- App / CORS / Logging --------------------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -52,11 +51,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Logging
 logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO))
 log = logging.getLogger("betting-machine")
 
-# ========= In-memory cache =========
+def _redact_api_key(url_str: str) -> str:
+    return re.sub(r"(apiKey=)[^&]+", r"\1REDACTED", url_str or "")
+
+# -------------------- Simple in-memory cache --------------------
 _cache: Dict[str, Dict[str, Any]] = {}  # key -> {"ts": epoch, "data": object}
 
 def cache_get(key: str):
@@ -69,19 +70,17 @@ def cache_set(key: str, data: Any):
     _cache[key] = {"ts": time.time(), "data": data}
     return data
 
-def cache_clear(key: str):
-    try:
-        _cache.pop(key, None)
-    except Exception:
-        pass
+def cache_clear(*keys: str):
+    for k in keys:
+        _cache.pop(k, None)
 
-# ========= Helpers =========
+# -------------------- Helpers --------------------
 def iso(dt: datetime) -> str:
-    # Force UTC, drop microseconds, format exactly YYYY-MM-DDTHH:MM:SSZ
-    return dt.astimezone(timezone.utc).replace(microsecond=0).strftime('%Y-%m-%dT%H:%M:%SZ')
+    # Exactly YYYY-MM-DDTHH:MM:SSZ for The Odds API commenceTimeFrom/To
+    return dt.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def parse_iso(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    return datetime.fromisoformat((s or "").replace("Z", "+00:00")).astimezone(timezone.utc)
 
 def current_window():
     now = datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -113,58 +112,41 @@ def league_label_from_odds_key(sport_key: str) -> Optional[str]:
     if "ncaaf" in sk: return "NCAA"
     return None
 
-import io, csv, json  # (if not already imported)
+def join_key(league: Optional[str], dt_iso: Optional[str], away: Optional[str], home: Optional[str]) -> str:
+    lg = (league or "").strip().upper()
+    iso_dt = ""
+    if dt_iso:
+        try:
+            iso_dt = parse_iso(dt_iso).replace(minute=0, second=0, microsecond=0).isoformat()
+        except Exception:
+            iso_dt = dt_iso
+    a = (away or "").strip().lower().replace(" ", "")
+    h = (home or "").strip().lower().replace(" ", "")
+    return f"{lg}|{iso_dt}|{a}@{h}"
+
+def synth_row_key(league: Optional[str], game_time: Optional[str], away: Optional[str], home: Optional[str]) -> str:
+    lg  = (league or "").upper().strip()
+    iso_dt = ""
+    if game_time:
+        try:
+            iso_dt = parse_iso(game_time).isoformat()
+        except Exception:
+            iso_dt = str(game_time)
+    a = (away or "").lower().replace(" ", "")
+    h = (home or "").lower().replace(" ", "")
+    return f"{lg}|{iso_dt}|{a}@{h}"
+
+# -------------------- History loader (optional) --------------------
+def _csv_to_dicts(text: str) -> List[Dict[str, Any]]:
+    return [row for row in csv.DictReader(io.StringIO(text))]
 
 def _hist_load_from_file(path: str):
     try:
-        with open(path, "rb") as f:
-            raw = f.read().decode("utf-8", errors="ignore")
+        raw = Path(path).read_text(encoding="utf-8", errors="ignore")
         if path.lower().endswith(".csv"):
-            return [row for row in csv.DictReader(io.StringIO(raw))]
-        try:
-            data = json.loads(raw)
-            return data if isinstance(data, list) else []
-        except Exception:
-            return [row for row in csv.DictReader(io.StringIO(raw))]
-    except Exception as e:
-        # if you have a logger named `log`, use it; else silence is fine
-        return []
-
-async def _hist_load_from_url(url: str):
-    try:
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.get(url)
-            r.raise_for_status()
-            ct = (r.headers.get("content-type","") or "").lower()
-            if "text/csv" in ct or url.lower().endswith(".csv"):
-                return [row for row in csv.DictReader(io.StringIO(r.text))]
-            data = r.json()
-            return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-PREFERRED_BOOKS = ["pinnacle","circa","bookmaker","draftkings","fanduel","betmgm"]
-def pick_market(bookmakers: List[Dict[str, Any]], key: str):
-    for bk in PREFERRED_BOOKS:
-        b = next((x for x in bookmakers or [] if x.get("key")==bk), None)
-        m = next((m for m in (b.get("markets") or []) if m.get("key")==key), None) if b else None
-        if m: return m, bk
-    if bookmakers:
-        m0 = next((m for m in (bookmakers[0].get("markets") or []) if m.get("key")==key), None)
-        if m0: return m0, bookmakers[0].get("key")
-    return None, None
-
-def _hist_load_from_file(path: str):
-    try:
-        with open(path, "rb") as f:
-            raw = f.read().decode("utf-8", errors="ignore")
-        if path.lower().endswith(".csv"):
-            return [row for row in csv.DictReader(io.StringIO(raw))]
-        try:
-            data = json.loads(raw)
-            return data if isinstance(data, list) else []
-        except Exception:
-            return [row for row in csv.DictReader(io.StringIO(raw))]
+            return _csv_to_dicts(raw)
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
     except Exception:
         return []
 
@@ -175,7 +157,7 @@ async def _hist_load_from_url(url: str):
             r.raise_for_status()
             ct = (r.headers.get("content-type","") or "").lower()
             if "text/csv" in ct or url.lower().endswith(".csv"):
-                return [row for row in csv.DictReader(io.StringIO(r.text))]
+                return _csv_to_dicts(r.text)
             data = r.json()
             return data if isinstance(data, list) else []
     except Exception:
@@ -194,46 +176,88 @@ async def load_history_rows():
     cache_set("history_rows", rows)
     return rows
 
-@app.get("/api/history")
-async def api_history(refresh: bool = False):
-    if refresh:
-        cache_clear("history_rows")
-    return await load_history_rows()
-
-@app.get("/api/history/debug")
-async def api_history_debug():
-    info = {
-        "HIST_SOURCE": HIST_SOURCE,
-        "HIST_PATH": HIST_PATH,
-        "HIST_URL": HIST_URL,
-        "cwd": os.getcwd(),
-    }
+# -------------------- Model loader (optional merge) --------------------
+async def _model_load_from_url(url: str):
     try:
-        if HIST_SOURCE == "file" and HIST_PATH:
-            p = Path(HIST_PATH)
-            info["abs_path"]    = str(p.resolve())
-            info["file_exists"] = p.exists()
-            if p.exists():
-                info["file_size"] = p.stat().st_size
-                head = ""
-                try:
-                    with open(p, "rb") as f:
-                        head = f.read(200).decode("utf-8", errors="ignore")
-                except Exception:
-                    pass
-                info["file_head"] = head
-        rows = await load_history_rows()
-        info["rows_detected"] = len(rows)
-        info["first_row"]     = rows[0] if rows else None
-    except Exception as e:
-        info["error"] = str(e)
-    return info
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get(url)
+            r.raise_for_status()
+            ct = (r.headers.get("content-type","") or "").lower()
+            if "text/csv" in ct or url.lower().endswith(".csv"):
+                return _csv_to_dicts(r.text)
+            data = r.json()
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
 
-# ========= Adapters =========
+def _model_load_from_file(path: str):
+    try:
+        raw = Path(path).read_text(encoding="utf-8", errors="ignore")
+        if path.lower().endswith(".csv"):
+            return _csv_to_dicts(raw)
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+def _norm_league(s: Optional[str]) -> str:
+    s = (s or "").strip().upper()
+    if s in ("NCAAF", "CFB", "NCAA FOOTBALL", "NCAA"): return "NCAA"
+    return s
+
+def _norm_team(s: Optional[str]) -> str:
+    return (s or "").strip()
+
+def _coerce_iso(s: Optional[str]) -> Optional[str]:
+    if not s: return None
+    try:
+        return parse_iso(s).isoformat().replace("+00:00","Z")
+    except Exception:
+        try:
+            return datetime.fromisoformat(s).astimezone(timezone.utc).isoformat().replace("+00:00","Z")
+        except Exception:
+            return s
+
+async def load_model_rows():
+    cached = cache_get("model_rows")
+    if cached is not None:
+        return cached
+
+    if   MODEL_SOURCE == "file" and MODEL_PATH:
+        rows = _model_load_from_file(MODEL_PATH)
+    elif MODEL_SOURCE == "url"  and MODEL_URL:
+        rows = await _model_load_from_url(MODEL_URL)
+    else:
+        rows = []
+
+    normed = []
+    for r in rows:
+        league = _norm_league(r.get("league") or r.get("League"))
+        game_time = r.get("game_time") or r.get("kickoff_time") or r.get("datetime")
+        game_time = _coerce_iso(game_time)
+        home = _norm_team(r.get("home_team") or r.get("Home") or r.get("home"))
+        away = _norm_team(r.get("away_team") or r.get("Away") or r.get("away"))
+        if not (league and game_time and home and away):
+            continue
+        normed.append({**r, "league": league, "game_time": game_time, "home_team": home, "away_team": away})
+
+    cache_set("model_rows", normed)
+    return normed
+
+# -------------------- Odds / Slates / Weather adapters --------------------
+PREFERRED_BOOKS = ["pinnacle","circa","bookmaker","draftkings","fanduel","betmgm"]
+
+def pick_market(bookmakers: List[Dict[str, Any]], key: str):
+    for bk in PREFERRED_BOOKS:
+        b = next((x for x in bookmakers or [] if x.get("key")==bk), None)
+        m = next((m for m in (b.get("markets") or []) if m.get("key")==key), None) if b else None
+        if m: return m, bk
+    if bookmakers:
+        m0 = next((m for m in (bookmakers[0].get("markets") or []) if m.get("key")==key), None)
+        if m0: return m0, bookmakers[0].get("key")
+    return None, None
+
 async def fetch_odds_for(sport_key: str, start_iso: str, end_iso: str) -> List[Dict[str, Any]]:
-    """
-    The Odds API v4 supports commenceTimeFrom/commenceTimeTo to widen the window.
-    """
     if not ODDS_API_KEY:
         raise HTTPException(status_code=500, detail="ODDS_API_KEY not set")
     params = {
@@ -270,16 +294,11 @@ async def fetch_all_odds() -> List[Dict[str, Any]]:
         out.extend(res)
 
     if not out and had_error:
-        # Surface that something failed so you don't just see [] forever
         raise HTTPException(status_code=502, detail="All odds fetches failed; check /debug/odds")
 
     return out
 
 async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]:
-    """
-    API-SPORTS (American Football) via RapidAPI.
-    GET https://api-american-football.p.rapidapi.com/games?date=YYYY-MM-DD
-    """
     key = APISPORTS_KEY or os.getenv("RAPIDAPI_KEY")
     if not key:
         return []
@@ -288,7 +307,7 @@ async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.get(f"{APISPORTS_BASE}/games", headers=headers, params=params)
         if r.status_code >= 400:
-            return []  # be forgiving
+            return []
         data = r.json().get("response", [])
         rows = []
         for g in data:
@@ -313,9 +332,6 @@ async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]
         return rows
 
 async def fetch_cfbd_venues_map() -> Dict[str, Dict[str, Any]]:
-    """
-    CFBD venues for college: map by school/venue -> {lat, lon, tz}
-    """
     cached = cache_get("cfbd_venues")
     if cached is not None:
         return cached
@@ -361,28 +377,16 @@ async def get_weather_points(lat: float, lon: float, start_iso: str, end_iso: st
         hourly = next((x.get("intervals", []) for x in data if x.get("timestep")=="1h"), [])
         return hourly
 
-# ========= Core: build unified rows =========
-def join_key(league: Optional[str], dt_iso: Optional[str], away: Optional[str], home: Optional[str]) -> str:
-    lg = (league or "").strip().upper()
-    iso_dt = ""
-    if dt_iso:
-        try:
-            iso_dt = parse_iso(dt_iso).replace(minute=0, second=0, microsecond=0).isoformat()
-        except Exception:
-            iso_dt = dt_iso
-    a = (away or "").strip().lower().replace(" ", "")
-    h = (home or "").strip().lower().replace(" ", "")
-    return f"{lg}|{iso_dt}|{a}@{h}"
-
+# -------------------- Core: build unified rows --------------------
 async def build_rows() -> List[Dict[str, Any]]:
     cached = cache_get("model_data_rows")
     if cached is not None:
         return cached
 
-    # 1) Odds (NFL + NCAAF) across a wider window so we don't get []
+    # 1) Odds (NFL + NCAAF)
     odds = await fetch_all_odds()
 
-    # 2) Optional: slates for venue/season/week (next 7 days)
+    # 2) Slates for next 7 days (for season/week/venues; optional)
     today = datetime.utcnow().date()
     slate_rows: List[Dict[str, Any]] = []
     try:
@@ -393,19 +397,26 @@ async def build_rows() -> List[Dict[str, Any]]:
                 slate_rows.extend(res)
     except Exception:
         pass
-
     slate_idx: Dict[str, Dict[str, Any]] = {
         join_key(g.get("league"), g.get("game_time"), g.get("away_team"), g.get("home_team")): g
         for g in slate_rows
     }
 
-    # 3) CFBD venues (fallback for NCAA)
+    # 3) Model rows (optional)
+    model_rows = await load_model_rows()
+    model_idx = {
+        join_key(m.get("league"), m.get("game_time"), m.get("away_team"), m.get("home_team")): m
+        for m in model_rows
+    }
+
+    # 4) CFBD venues (NCAA fallback)
     cfbd_map = await fetch_cfbd_venues_map()
 
     rows: List[Dict[str, Any]] = []
     for ev in odds:
         lg = league_label_from_odds_key(ev.get("sport_key") or ev.get("sport_title", ""))
-        if not lg: continue
+        if not lg:
+            continue
         commence_time = ev.get("commence_time")
         home = ev.get("home_team")
         away = ev.get("away_team")
@@ -422,9 +433,9 @@ async def build_rows() -> List[Dict[str, Any]]:
         over    = next((o for o in (m_totals or {}).get("outcomes", []) if (o.get("name") or "").lower()=="over"), {})
         under   = next((o for o in (m_totals or {}).get("outcomes", []) if (o.get("name") or "").lower()=="under"), {})
         sp_home = next((o for o in (m_spreads or {}).get("outcomes", []) if o.get("name")==home), {})
-        sp_away = next((o for o in (m_spreads or {}).get("outcomes", []) if o.get("name")==away), {})
+        # sp_away = next((o for o in (m_spreads or {}).get("outcomes", []) if o.get("name")==away), {})  # not used directly
 
-        row = {
+        row: Dict[str, Any] = {
             "date": commence_time,
             "league": lg, "season": None, "week": None,
             "game_id": ev.get("id"),
@@ -438,7 +449,7 @@ async def build_rows() -> List[Dict[str, Any]]:
             "sportsbook_ml_odds_away": ml_away.get("price"),
             "book_spread": bk_spread, "book_total": bk_total, "book_h2h": bk_h2h,
 
-            # model fields (to be filled once your model is merged)
+            # model fields (populated from model file if provided)
             "model_spread": None, "model_total": None, "model_pick": None,
             "confidence_pct": None, "edge_vs_line": None,
             "ou_pick": None, "ou_confidence_pct": None, "total_edge": None,
@@ -455,15 +466,37 @@ async def build_rows() -> List[Dict[str, Any]]:
             row["season"] = s.get("season")
             row["week"]   = s.get("week")
 
-        # ---------- Weather (auto venue resolution) ----------
+        # merge model fields (if any)
+        m = model_idx.get(k)
+        if m:
+            for fld in [
+                "model_spread","model_total","model_pick","confidence_pct","edge_vs_line",
+                "ou_pick","ou_confidence_pct","total_edge",
+                "model_ml_prob_home","model_ml_prob_away","ml_value_flag",
+                "trap_alert","sharp_flag","volatility_score"
+            ]:
+                if m.get(fld) is not None:
+                    row[fld] = m[fld]
+
+        # compute edges if inputs exist and model didn't provide them
+        try:
+            if row.get("model_spread") is not None and row.get("sportsbook_spread") is not None and row.get("edge_vs_line") is None:
+                row["edge_vs_line"] = float(row["model_spread"]) - float(row["sportsbook_spread"])
+        except Exception:
+            pass
+        try:
+            if row.get("model_total") is not None and row.get("sportsbook_total") is not None and row.get("total_edge") is None:
+                row["total_edge"] = float(row["model_total"]) - float(row["sportsbook_total"])
+        except Exception:
+            pass
+
+        # weather (venue from slate; NCAA fallback via CFBD school)
         venue_lat = (s or {}).get("venue_lat")
         venue_lon = (s or {}).get("venue_lon")
-
-        # NCAA fallback via CFBD school mapping
         if (venue_lat is None or venue_lon is None) and lg == "NCAA" and CFBD_KEY:
-            m = cfbd_map.get(f"school::{(home or '').lower()}")
-            if m:
-                venue_lat, venue_lon = m["lat"], m["lon"]
+            m_school = cfbd_map.get(f"school::{(home or '').lower()}")
+            if m_school:
+                venue_lat, venue_lon = m_school["lat"], m_school["lon"]
 
         if venue_lat is not None and venue_lon is not None and commence_time:
             k_dt = parse_iso(commence_time)
@@ -474,56 +507,50 @@ async def build_rows() -> List[Dict[str, Any]]:
                 nearest = nearest_hour_point(pts, commence_time)
                 values = (nearest or {}).get("values", {})
                 row["weather_alert"] = compute_weather_alert(values)
-                row["weather_snapshot"] = values  # optional for detail UI
+                row["weather_snapshot"] = values
             except Exception as e:
-                log.warning("Weather fetch failed for %s vs %s: %s", away, home, e)
+                log.warning("Weather fetch failed for %s @ %s: %s", lg, commence_time, e)
 
+        # stable primary key for Retool tables
+        row["row_key"] = row.get("game_id") or synth_row_key(lg, commence_time, away, home)
         rows.append(row)
 
     cache_set("model_data_rows", rows)
     return rows
 
-# ========= Routes =========
+# -------------------- Routes --------------------
 @app.get("/")
 async def root():
     start_iso, end_iso = current_window()
     return {
         "ok": True,
-        "endpoints": ["/health", "/version", "/api/model-data", "/debug/env", "/debug/odds"],
+        "endpoints": ["/health", "/version", "/api/model-data", "/api/history", "/api/model/debug", "/debug/env", "/debug/odds"],
         "window": {"from": start_iso, "to": end_iso}
     }
 
 @app.get("/api/model-data")
-async def model_data():
+async def api_model_data(refresh: bool = False):
+    if refresh:
+        cache_clear("model_data_rows", "model_rows", "cfbd_venues")
     return await build_rows()
 
-@app.get("/health")
-async def health():
-    return {"ok": True, "last_sync": cache_get("model_data_rows") is not None}
-
-@app.get("/version")
-async def version():
-    return {"model": "lr_v1", "features": 18, "source": "odds+slate+weather", "ttl_seconds": CACHE_TTL}
-
-async def load_history_rows():
-    cached = cache_get("history_rows")
-    if cached is not None:
-        return cached
-    if HIST_SOURCE == "file" and HIST_PATH:
-        rows = _hist_load_from_file(HIST_PATH)
-    elif HIST_SOURCE == "url" and HIST_URL:
-        rows = await _hist_load_from_url(HIST_URL)
-    else:
-        rows = []
-    cache_set("history_rows", rows)
-    return rows
-
 @app.get("/api/history")
-async def api_history():
-    # returns your historical CSV/JSON as-is
+async def api_history(refresh: bool = False):
+    if refresh:
+        cache_clear("history_rows")
     return await load_history_rows()
 
-# ---- Debug endpoints ----
+@app.get("/api/model/debug")
+async def api_model_debug():
+    rows = await load_model_rows()
+    return {
+        "MODEL_SOURCE": MODEL_SOURCE,
+        "MODEL_PATH": MODEL_PATH,
+        "MODEL_URL": MODEL_URL,
+        "rows_detected": len(rows),
+        "first_row": rows[0] if rows else None
+    }
+
 @app.get("/debug/env")
 def debug_env():
     start_iso, end_iso = current_window()
@@ -576,3 +603,11 @@ async def debug_odds():
             except Exception as e:
                 results[sk] = {"error": str(e)}
     return {"window": {"from": start_iso, "to": end_iso}, "results": results}
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "last_sync": cache_get("model_data_rows") is not None}
+
+@app.get("/version")
+async def version():
+    return {"model": "lr_v1", "features": 18, "source": "odds+slate+weather(+model?)", "ttl_seconds": CACHE_TTL}
