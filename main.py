@@ -173,7 +173,8 @@ def synth_row_key(league: Optional[str], game_time: Optional[str], away: Optiona
 # ---- Type coercion for model fields ----
 NUM_FIELDS = [
     "model_spread","model_total","confidence_pct","ou_confidence_pct",
-    "model_ml_prob_home","model_ml_prob_away","volatility_score"
+    "model_ml_prob_home","model_ml_prob_away","volatility_score",
+    "edge_vs_line","total_edge"  # include edges too
 ]
 BOOL_FIELDS = ["ml_value_flag","trap_alert","sharp_flag","weather_alert"]
 
@@ -186,10 +187,17 @@ def _to_boolish(v):
     return None
 
 def coerce_types(row: Dict[str, Any]):
+    # blank strings -> None, then cast numerics; coerce booleans
     for f in NUM_FIELDS:
-        if f in row and row[f] is not None:
-            try: row[f] = float(row[f])
-            except: pass
+        if f in row:
+            v = row[f]
+            if isinstance(v, str) and v.strip() == "":
+                row[f] = None
+            elif v is not None:
+                try:
+                    row[f] = float(v)
+                except:
+                    pass
     for f in BOOL_FIELDS:
         if f in row:
             row[f] = _to_boolish(row[f])
@@ -575,14 +583,18 @@ async def build_rows() -> List[Dict[str, Any]]:
                 if m.get(fld) is not None:
                     row[fld] = m[fld]
 
-        # compute edges if inputs exist and model didn't provide them
+        # compute edges if inputs exist and model didn't provide them (handle blank strings)
         try:
-            if row.get("model_spread") is not None and row.get("sportsbook_spread") is not None and row.get("edge_vs_line") is None:
+            if (row.get("model_spread") is not None
+                and row.get("sportsbook_spread") is not None
+                and row.get("edge_vs_line") in (None, "", "NaN")):
                 row["edge_vs_line"] = float(row["model_spread"]) - float(row["sportsbook_spread"])
         except Exception:
             pass
         try:
-            if row.get("model_total") is not None and row.get("sportsbook_total") is not None and row.get("total_edge") is None:
+            if (row.get("model_total") is not None
+                and row.get("sportsbook_total") is not None
+                and row.get("total_edge") in (None, "", "NaN")):
                 row["total_edge"] = float(row["model_total"]) - float(row["sportsbook_total"])
         except Exception:
             pass
@@ -620,7 +632,7 @@ async def build_rows() -> List[Dict[str, Any]]:
         # stable primary key for Retool tables
         row["row_key"] = row.get("game_id") or synth_row_key(lg, commence_time, away, home)
 
-        # make sure types are clean (model files often ship numbers as strings)
+        # normalize types at the very end (turn "74" -> 74.0, "false" -> False, "" -> None, etc.)
         coerce_types(row)
 
         rows.append(row)
