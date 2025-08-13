@@ -1,4 +1,4 @@
-# main.py  — Betting Machine API (FastAPI on Render)
+# main.py — Betting Machine API (FastAPI on Render)
 
 import os, re, io, csv, json, time, logging, asyncio
 from pathlib import Path
@@ -43,39 +43,40 @@ SPORT_KEYS = ["americanfootball_nfl", "americanfootball_ncaaf"]
 
 # Minimal NFL stadium map (home team -> lat/lon). Good enough for weather alerts.
 NFL_STADIUMS = {
-    "Arizona Cardinals": {"lat": 33.5276, "lon": -112.2626},      # State Farm Stadium
-    "Atlanta Falcons": {"lat": 33.7554, "lon": -84.4008},         # Mercedes-Benz Stadium
-    "Baltimore Ravens": {"lat": 39.2780, "lon": -76.6227},        # M&T Bank Stadium
-    "Buffalo Bills": {"lat": 42.7738, "lon": -78.7869},           # Highmark Stadium
-    "Carolina Panthers": {"lat": 35.2251, "lon": -80.8526},       # Bank of America Stadium
-    "Chicago Bears": {"lat": 41.8625, "lon": -87.6166},           # Soldier Field
-    "Cincinnati Bengals": {"lat": 39.0954, "lon": -84.5160},      # Paycor Stadium
-    "Cleveland Browns": {"lat": 41.5061, "lon": -81.6995},        # Cleveland Browns Stadium
-    "Dallas Cowboys": {"lat": 32.7473, "lon": -97.0945},          # AT&T Stadium
-    "Denver Broncos": {"lat": 39.7439, "lon": -105.0201},         # Empower Field at Mile High
-    "Detroit Lions": {"lat": 42.3400, "lon": -83.0456},           # Ford Field
-    "Green Bay Packers": {"lat": 44.5013, "lon": -88.0622},       # Lambeau Field
-    "Houston Texans": {"lat": 29.6847, "lon": -95.4107},          # NRG Stadium
-    "Indianapolis Colts": {"lat": 39.7601, "lon": -86.1639},      # Lucas Oil Stadium
-    "Jacksonville Jaguars": {"lat": 30.3239, "lon": -81.6373},    # EverBank Stadium
-    "Kansas City Chiefs": {"lat": 39.0489, "lon": -94.4839},      # GEHA Field at Arrowhead
-    "Las Vegas Raiders": {"lat": 36.0909, "lon": -115.1833},      # Allegiant Stadium
-    "Los Angeles Chargers": {"lat": 33.9530, "lon": -118.3390},   # SoFi Stadium (approx)
-    "Los Angeles Rams": {"lat": 33.9530, "lon": -118.3390},       # SoFi Stadium (approx)
-    "Miami Dolphins": {"lat": 25.9580, "lon": -80.2389},          # Hard Rock Stadium
-    "Minnesota Vikings": {"lat": 44.9736, "lon": -93.2575},       # U.S. Bank Stadium
-    "New England Patriots": {"lat": 42.0909, "lon": -71.2643},    # Gillette Stadium
-    "New Orleans Saints": {"lat": 29.9509, "lon": -90.0815},      # Caesars Superdome
-    "New York Giants": {"lat": 40.8135, "lon": -74.0745},         # MetLife Stadium
-    "New York Jets": {"lat": 40.8135, "lon": -74.0745},           # MetLife Stadium
-    "Philadelphia Eagles": {"lat": 39.9008, "lon": -75.1675},     # Lincoln Financial Field
-    "Pittsburgh Steelers": {"lat": 40.4468, "lon": -80.0158},     # Acrisure Stadium
-    "San Francisco 49ers": {"lat": 37.4030, "lon": -121.9700},    # Levi's Stadium
-    "Seattle Seahawks": {"lat": 47.5952, "lon": -122.3316},       # Lumen Field
-    "Tampa Bay Buccaneers": {"lat": 27.9759, "lon": -82.5033},    # Raymond James Stadium
-    "Tennessee Titans": {"lat": 36.1665, "lon": -86.7713},        # Nissan Stadium
-    "Washington Commanders": {"lat": 38.9078, "lon": -76.8646},   # FedEx Field (approx)
+    "Arizona Cardinals": {"lat": 33.5276, "lon": -112.2626},
+    "Atlanta Falcons": {"lat": 33.7554, "lon": -84.4008},
+    "Baltimore Ravens": {"lat": 39.2780, "lon": -76.6227},
+    "Buffalo Bills": {"lat": 42.7738, "lon": -78.7869},
+    "Carolina Panthers": {"lat": 35.2251, "lon": -80.8526},
+    "Chicago Bears": {"lat": 41.8625, "lon": -87.6166},
+    "Cincinnati Bengals": {"lat": 39.0954, "lon": -84.5160},
+    "Cleveland Browns": {"lat": 41.5061, "lon": -81.6995},
+    "Dallas Cowboys": {"lat": 32.7473, "lon": -97.0945},
+    "Denver Broncos": {"lat": 39.7439, "lon": -105.0201},
+    "Detroit Lions": {"lat": 42.3400, "lon": -83.0456},
+    "Green Bay Packers": {"lat": 44.5013, "lon": -88.0622},
+    "Houston Texans": {"lat": 29.6847, "lon": -95.4107},
+    "Indianapolis Colts": {"lat": 39.7601, "lon": -86.1639},
+    "Jacksonville Jaguars": {"lat": 30.3239, "lon": -81.6373},
+    "Kansas City Chiefs": {"lat": 39.0489, "lon": -94.4839},
+    "Las Vegas Raiders": {"lat": 36.0909, "lon": -115.1833},
+    "Los Angeles Chargers": {"lat": 33.9530, "lon": -118.3390},
+    "Los Angeles Rams": {"lat": 33.9530, "lon": -118.3390},
+    "Miami Dolphins": {"lat": 25.9580, "lon": -80.2389},
+    "Minnesota Vikings": {"lat": 44.9736, "lon": -93.2575},
+    "New England Patriots": {"lat": 42.0909, "lon": -71.2643},
+    "New Orleans Saints": {"lat": 29.9509, "lon": -90.0815},
+    "New York Giants": {"lat": 40.8135, "lon": -74.0745},
+    "New York Jets": {"lat": 40.8135, "lon": -74.0745},
+    "Philadelphia Eagles": {"lat": 39.9008, "lon": -75.1675},
+    "Pittsburgh Steelers": {"lat": 40.4468, "lon": -80.0158},
+    "San Francisco 49ers": {"lat": 37.4030, "lon": -121.9700},
+    "Seattle Seahawks": {"lat": 47.5952, "lon": -122.3316},
+    "Tampa Bay Buccaneers": {"lat": 27.9759, "lon": -82.5033},
+    "Tennessee Titans": {"lat": 36.1665, "lon": -86.7713},
+    "Washington Commanders": {"lat": 38.9078, "lon": -76.8646},
 }
+
 # -------------------- App / CORS / Logging --------------------
 app = FastAPI()
 app.add_middleware(
@@ -110,6 +111,22 @@ def cache_clear(*keys: str):
         _cache.pop(k, None)
 
 # -------------------- Helpers --------------------
+def maybe_float(x):
+    try:
+        if x is None or (isinstance(x, str) and not x.strip()):
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+def maybe_bool(x):
+    if isinstance(x, bool):
+        return x
+    s = str(x).strip().lower()
+    if s in ("true","1","yes","y"): return True
+    if s in ("false","0","no","n"): return False
+    return None
+
 def iso(dt: datetime) -> str:
     # Exactly YYYY-MM-DDTHH:MM:SSZ for The Odds API commenceTimeFrom/To
     return dt.astimezone(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -170,19 +187,6 @@ def synth_row_key(league: Optional[str], game_time: Optional[str], away: Optiona
     a = (away or "").lower().replace(" ", "")
     h = (home or "").lower().replace(" ", "")
     return f"{lg}|{iso_dt}|{a}@{h}"
-
-# ---- small helpers (place near other helpers) ----
-def _to_float(v):
-    try:
-        if v is None or v == "": return None
-        return float(v)
-    except Exception:
-        return None
-
-def _to_bool(v):
-    if isinstance(v, bool): return v
-    if v is None: return None
-    return str(v).strip().lower() in ("1","true","yes","y","t")
 
 # -------------------- History loader (optional) --------------------
 def _csv_to_dicts(text: str) -> List[Dict[str, Any]]:
@@ -353,15 +357,12 @@ async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]
     Normalizes date to ISO string so our join_key matches Odds API commence_time.
     """
     def _flatten_dt(raw):
-        # raw might be str, or dict {timezone,date,time,timestamp}
         if not raw:
             return None
         if isinstance(raw, str):
-            # assume already ISO-ish
             try:
                 return parse_iso(raw).isoformat().replace("+00:00","Z")
             except Exception:
-                # best effort, add Z if just 'YYYY-MM-DD'
                 if len(raw) == 10:
                     return f"{raw}T00:00:00Z"
                 return raw
@@ -396,7 +397,6 @@ async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]
             season = (g.get("league") or {}).get("season") or g.get("season")
             week   = (g.get("week") or {}).get("number") or g.get("week")
 
-            # raw date shapes can vary across API-SPORTS payloads
             raw_dt = g.get("date") or (g.get("game") or {}).get("date") or (g.get("fixture") or {}).get("date")
             dt_iso = _flatten_dt(raw_dt)
 
@@ -405,7 +405,6 @@ async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]
             away = (teams.get("away") or {}).get("name") or g.get("away")
 
             venue = (g.get("game") or {}).get("venue") or g.get("venue") or {}
-            # these are often missing for football; we’ll keep them if present
             lat = (venue.get("coordinates") or {}).get("latitude") or venue.get("lat")
             lon = (venue.get("coordinates") or {}).get("longitude") or venue.get("lon")
 
@@ -467,7 +466,6 @@ async def get_weather_points(lat: float, lon: float, start_iso: str, end_iso: st
         return hourly
 
 # -------------------- Core: build unified rows --------------------
-
 async def build_rows() -> List[Dict[str, Any]]:
     cached = cache_get("model_data_rows")
     if cached is not None:
@@ -502,6 +500,15 @@ async def build_rows() -> List[Dict[str, Any]]:
     # 4) CFBD venues (NCAA fallback)
     cfbd_map = await fetch_cfbd_venues_map()
 
+    # Field typing maps for clean merge
+    _float_fields = [
+        "model_spread","model_total","confidence_pct","edge_vs_line",
+        "ou_confidence_pct","total_edge","model_ml_prob_home","model_ml_prob_away",
+        "volatility_score"
+    ]
+    _bool_fields  = ["ml_value_flag","trap_alert","sharp_flag"]
+    _str_fields   = ["model_pick","ou_pick"]
+
     rows: List[Dict[str, Any]] = []
     for ev in odds:
         lg = league_label_from_odds_key(ev.get("sport_key") or ev.get("sport_title", ""))
@@ -523,7 +530,6 @@ async def build_rows() -> List[Dict[str, Any]]:
         over    = next((o for o in (m_totals or {}).get("outcomes", []) if (o.get("name") or "").lower()=="over"), {})
         under   = next((o for o in (m_totals or {}).get("outcomes", []) if (o.get("name") or "").lower()=="under"), {})
         sp_home = next((o for o in (m_spreads or {}).get("outcomes", []) if o.get("name")==home), {})
-        # sp_away = next((o for o in (m_spreads or {}).get("outcomes", []) if o.get("name")==away), {})  # not used directly
 
         row: Dict[str, Any] = {
             "date": commence_time,
@@ -544,10 +550,7 @@ async def build_rows() -> List[Dict[str, Any]]:
             "confidence_pct": None, "edge_vs_line": None,
             "ou_pick": None, "ou_confidence_pct": None, "total_edge": None,
             "model_ml_prob_home": None, "model_ml_prob_away": None, "ml_value_flag": None,
-
-            # signals
-            "trap_alert": None, "sharp_flag": None,
-            "weather_alert": None, "volatility_score": None,
+            "trap_alert": None, "sharp_flag": None, "weather_alert": None, "volatility_score": None,
         }
 
         # season/week if slate had it
@@ -556,17 +559,21 @@ async def build_rows() -> List[Dict[str, Any]]:
             row["season"] = s.get("season")
             row["week"]   = s.get("week")
 
-        # merge model fields (if any)
+        # ---- MERGE MODEL (typed) ----
         m = model_idx.get(k)
         if m:
-            for fld in [
-                "model_spread","model_total","model_pick","confidence_pct","edge_vs_line",
-                "ou_pick","ou_confidence_pct","total_edge",
-                "model_ml_prob_home","model_ml_prob_away","ml_value_flag",
-                "trap_alert","sharp_flag","volatility_score"
-            ]:
-                if m.get(fld) is not None:
-                    row[fld] = m[fld]
+            for f in _float_fields:
+                v = maybe_float(m.get(f))
+                if v is not None:
+                    row[f] = v
+            for f in _bool_fields:
+                v = maybe_bool(m.get(f))
+                if v is not None:
+                    row[f] = v
+            for f in _str_fields:
+                v = m.get(f)
+                if v is not None and str(v) != "":
+                    row[f] = v
 
         # compute edges if inputs exist and model didn't provide them
         try:
@@ -580,13 +587,21 @@ async def build_rows() -> List[Dict[str, Any]]:
         except Exception:
             pass
 
-        # weather (venue from slate; NCAA fallback via CFBD school)
+        # ---------- Weather (auto venue resolution) ----------
         venue_lat = (s or {}).get("venue_lat")
         venue_lon = (s or {}).get("venue_lon")
+
+        # NCAA fallback via CFBD school mapping
         if (venue_lat is None or venue_lon is None) and lg == "NCAA" and CFBD_KEY:
             m_school = cfbd_map.get(f"school::{(home or '').lower()}")
             if m_school:
                 venue_lat, venue_lon = m_school["lat"], m_school["lon"]
+
+        # NFL fallback via static stadium map
+        if (venue_lat is None or venue_lon is None) and lg == "NFL":
+            st = NFL_STADIUMS.get(home or "")
+            if st:
+                venue_lat, venue_lon = st["lat"], st["lon"]
 
         if venue_lat is not None and venue_lon is not None and commence_time:
             k_dt = parse_iso(commence_time)
@@ -601,35 +616,20 @@ async def build_rows() -> List[Dict[str, Any]]:
             except Exception as e:
                 log.warning("Weather fetch failed for %s @ %s: %s", lg, commence_time, e)
 
-        # stable primary key for Retool tables
+        # stable primary key for Retool (or any UI)
         row["row_key"] = row.get("game_id") or synth_row_key(lg, commence_time, away, home)
         rows.append(row)
 
     cache_set("model_data_rows", rows)
     return rows
 
-# ---------- Weather (auto venue resolution) ----------
-venue_lat = (s or {}).get("venue_lat")
-venue_lon = (s or {}).get("venue_lon")
-
-# NCAA fallback via CFBD school mapping (you already have this)
-if (venue_lat is None or venue_lon is None) and lg == "NCAA" and CFBD_KEY:
-    m = cfbd_map.get(f"school::{(home or '').lower()}")
-    if m:
-        venue_lat, venue_lon = m["lat"], m["lon"]
-
-# NEW: NFL fallback via static stadium map
-if (venue_lat is None or venue_lon is None) and lg == "NFL":
-    st = NFL_STADIUMS.get(home or "")
-    if st:
-        venue_lat, venue_lon = st["lat"], st["lon"]
 # -------------------- Routes --------------------
 @app.get("/")
 async def root():
     start_iso, end_iso = current_window()
     return {
         "ok": True,
-        "endpoints": ["/health", "/version", "/api/model-data", "/api/history", "/api/model/debug", "/debug/env", "/debug/odds"],
+        "endpoints": ["/health", "/version", "/api/model-data", "/api/history", "/api/model/debug", "/debug/env", "/debug/odds", "/debug/slates"],
         "window": {"from": start_iso, "to": end_iso}
     }
 
@@ -709,15 +709,6 @@ async def debug_odds():
                 results[sk] = {"error": str(e)}
     return {"window": {"from": start_iso, "to": end_iso}, "results": results}
 
-@app.get("/health")
-async def health():
-    return {"ok": True, "last_sync": cache_get("model_data_rows") is not None}
-
-@app.get("/version")
-async def version():
-    return {"model": "lr_v1", "features": 18, "source": "odds+slate+weather(+model?)", "ttl_seconds": CACHE_TTL}
-
-# Show next 14 days of slates from API-SPORTS and how many have venue coords
 @app.get("/debug/slates")
 async def debug_slates():
     today = datetime.utcnow().date()
@@ -739,3 +730,11 @@ async def debug_slates():
 def admin_refresh():
     _cache.clear()
     return {"ok": True, "cleared_keys": True}
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "last_sync": cache_get("model_data_rows") is not None}
+
+@app.get("/version")
+async def version():
+    return {"model": "lr_v1", "features": 18, "source": "odds+slate+weather(+model?)", "ttl_seconds": CACHE_TTL}
