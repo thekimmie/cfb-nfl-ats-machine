@@ -855,3 +855,25 @@ async def health():
 @app.get("/version")
 async def version():
     return {"model": "rf_script_or_file", "features": 18, "source": "odds+slate+weather+model", "ttl_seconds": CACHE_TTL}
+
+# ----- Script-model debug (raw output from predict.py) -----
+import importlib
+
+try:
+    _predict_mod = importlib.import_module("predict")
+    _HAS_SCRIPT_MODEL = hasattr(_predict_mod, "predict_games")
+except Exception:
+    _predict_mod = None
+    _HAS_SCRIPT_MODEL = False
+
+@app.get("/debug/model-script")
+def debug_model_script(limit: int = 10):
+    if not _HAS_SCRIPT_MODEL:
+        return {"enabled": False, "reason": "predict.predict_games() not found"}
+    try:
+        out = _predict_mod.predict_games()
+        if not isinstance(out, list):
+            return {"enabled": True, "note": "predict_games did not return a list", "type": str(type(out))}
+        return {"enabled": True, "count": len(out), "sample": out[:max(0, limit)]}
+    except Exception as e:
+        return {"enabled": True, "error": str(e)}
