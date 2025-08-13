@@ -1,6 +1,7 @@
 # main.py — Betting Machine API (FastAPI on Render)
 
-import os, re, io, csv, json, time, logging, asyncio, importlib, importlib.util
+import os, re, io, csv, json, time, logging, asyncio, importlib.util
+from types import ModuleType
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
@@ -23,7 +24,7 @@ HIST_SOURCE = os.getenv("HIST_SOURCE", "none").lower()      # "file" | "url" | "
 HIST_PATH   = os.getenv("HIST_PATH")                        # e.g. data/history.csv
 HIST_URL    = os.getenv("HIST_URL")                         # e.g. https://raw.githubusercontent.com/.../history.csv
 
-# Optional: model output (CSV/JSON) to merge into rows
+# Optional: model outputs
 MODEL_SOURCE = os.getenv("MODEL_SOURCE", "none").lower()    # "file" | "url" | "script" | "none"
 MODEL_PATH   = os.getenv("MODEL_PATH")                      # e.g. data/model_output.csv / .json OR ./predict.py for script mode
 MODEL_URL    = os.getenv("MODEL_URL")                       # e.g. https://raw.githubusercontent.com/.../model_output.json
@@ -300,7 +301,6 @@ async def load_model_rows():
         away = _norm_team(r.get("away_team") or r.get("Away") or r.get("away"))
         if not (league and game_time and home and away):
             continue
-        # Coerce types in-place so we don't merge strings later
         for f in NUM_FIELDS:
             if f in r and r[f] is not None:
                 try: r[f] = float(r[f])
@@ -313,48 +313,30 @@ async def load_model_rows():
     cache_set("model_rows", normed)
     return normed
 
-# -------------------- Script Model loader (predict.py) --------------------
-_predict_module: Optional[Any] = None
-_predict_name = "user_predict"
+# -------------------- Script loader (predict.py) --------------------
+_predict_mod: Optional[ModuleType] = None
+_predict_err: Optional[str] = None
 
-def load_predict_module(reload: bool = False):
-    """Import predict.py for MODEL_SOURCE=script. If MODEL_PATH is set, load from that path.
-       Otherwise try regular 'predict' module in PYTHONPATH. Pass reload=1 to hot-reload."""
-    global _predict_module
-
-    if MODEL_SOURCE != "script":
-        _predict_module = None
+def load_predict_module(reload: bool = False) -> Optional[ModuleType]:
+    """Load or reload the user script at MODEL_PATH and return the module, else None."""
+    global _predict_mod, _predict_err
+    if MODEL_SOURCE != "script" or not MODEL_PATH:
+        _predict_mod, _predict_err = None, "MODEL_SOURCE!='script' or MODEL_PATH not set"
         return None
+    if _predict_mod is not None and not reload:
+        return _predict_mod
 
-    if reload:
-        _predict_module = None
-
-    if _predict_module is not None:
-        return _predict_module
-
-    # Load from explicit file path if provided
-    if MODEL_PATH and Path(MODEL_PATH).is_file():
-        spec = importlib.util.spec_from_file_location(_predict_name, MODEL_PATH)
-        if not spec or not spec.loader:
+    try:
+        spec = importlib.util.spec_from_file_location("user_predict", MODEL_PATH)
+        if spec is None or spec.loader is None:
+            _predict_mod, _predict_err = None, f"Could not load spec for {MODEL_PATH}"
             return None
         mod = importlib.util.module_from_spec(spec)
-        try:
-            spec.loader.exec_module(mod)
-            _predict_module = mod
-            return _predict_module
-        except Exception as e:
-            log.error("Failed to import script model at %s: %s", MODEL_PATH, e)
-            return None
-
-    # Fallback: import by module name 'predict'
-    try:
-        mod = importlib.import_module("predict")
-        if reload:
-            mod = importlib.reload(mod)
-        _predict_module = mod
-        return _predict_module
+        spec.loader.exec_module(mod)  # can raise
+        _predict_mod, _predict_err = mod, None
+        return mod
     except Exception as e:
-        log.error("Failed to import 'predict' module: %s", e)
+        _predict_mod, _predict_err = None, f"Import failed: {e}"
         return None
 
 # -------------------- Odds / Slates / Weather adapters --------------------
@@ -457,6 +439,7 @@ async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]
             league = (g.get("league") or {}).get("name") or g.get("league")
             season = (g.get("league") or {}).get("season") or g.get("season")
             week   = (g.get("week") or {}).get("number") or g.get("week")
+
             raw_dt = g.get("date") or (g.get("game") or {}).get("date") or (g.get("fixture") or {}).get("date")
             dt_iso = _flatten_dt(raw_dt)
 
@@ -693,12 +676,7 @@ async def build_rows() -> List[Dict[str, Any]]:
                 "sportsbook_ml_odds_away": r.get("sportsbook_ml_odds_away"),
             } for r in rows]
 
-            try:
-                preds = pm.predict_games(inputs)  # preferred signature
-            except TypeError:
-                preds = pm.predict_games()        # fallback if script ignores inputs
-
-            preds = preds or []
+            preds = pm.predict_games(inputs) or []
             pred_idx = {
                 join_key(p.get("league"), p.get("game_time"), p.get("away_team"), p.get("home_team")): p
                 for p in preds if p.get("league") and p.get("game_time")
@@ -718,7 +696,8 @@ async def build_rows() -> List[Dict[str, Any]]:
                         r[fld] = p[fld]
                 # Re-coerce after merge
                 coerce_types(r)
-                # Fill edges if still missing
+
+                # fill edges if still missing
                 try:
                     if r.get("model_spread") is not None and r.get("sportsbook_spread") is not None and r.get("edge_vs_line") is None:
                         r["edge_vs_line"] = float(r["model_spread"]) - float(r["sportsbook_spread"])
@@ -771,28 +750,59 @@ async def api_model_debug():
         "first_row": rows[0] if rows else None
     }
 
-# ----- Script-model debug (raw output from predict.py) -----
 @app.get("/debug/model-script")
-def debug_model_script(limit: int = 10, reload: bool = False):
+async def debug_model_script(limit: int = 10, reload: bool = False):
     """
-    Calls predict.predict_games() and returns a sample of raw rows.
-    Use ?reload=1 to hot-reload predict.py after edits.
+    Build a minimal games payload from live odds and call predict.predict_games(games).
+    Use ?reload=1 after editing predict.py.
     """
     pm = load_predict_module(reload=bool(reload))
-    if not (pm and hasattr(pm, "predict_games")):
+    has_fn = bool(pm and hasattr(pm, "predict_games"))
+    if not has_fn:
         return {
             "enabled": MODEL_SOURCE == "script",
             "path": MODEL_PATH,
-            "has_predict_games": False
+            "has_predict_games": False,
+            "import_error": _predict_err,
+            "hint": "predict.py must define predict_games(games: List[dict]) -> List[dict]"
         }
+
+    odds = await fetch_all_odds()
+    games = []
+    for ev in odds[: max(0, limit)]:
+        lg = league_label_from_odds_key(ev.get("sport_key") or ev.get("sport_title", ""))
+        if not lg: continue
+        m_spreads, _ = pick_market(ev.get("bookmakers") or [], "spreads")
+        m_totals,  _ = pick_market(ev.get("bookmakers") or [], "totals")
+        m_h2h,     _ = pick_market(ev.get("bookmakers") or [], "h2h")
+        home = ev.get("home_team"); away = ev.get("away_team")
+        ml_home = next((o for o in (m_h2h or {}).get("outcomes", []) if o.get("name")==home), {})
+        ml_away = next((o for o in (m_h2h or {}).get("outcomes", []) if o.get("name")==away), {})
+        over    = next((o for o in (m_totals or {}).get("outcomes", []) if (o.get("name") or "").lower()=="over"), {})
+        under   = next((o for o in (m_totals or {}).get("outcomes", []) if (o.get("name") or "").lower()=="under"), {})
+        sp_home = next((o for o in (m_spreads or {}).get("outcomes", []) if o.get("name")==home), {})
+        games.append({
+            "league": lg,
+            "game_time": ev.get("commence_time"),
+            "home_team": home,
+            "away_team": away,
+            "sportsbook_spread": sp_home.get("point"),
+            "sportsbook_total": over.get("point") or under.get("point"),
+            "sportsbook_ml_odds_home": ml_home.get("price"),
+            "sportsbook_ml_odds_away": ml_away.get("price"),
+        })
+
     try:
-        out = pm.predict_games()
-        if isinstance(out, list):
-            keys = sorted({k for r in out if isinstance(r, dict) for k in r.keys()})
-            return {"enabled": True, "count": len(out), "keys": keys, "sample": out[:max(0, limit)]}
-        return {"enabled": True, "note": "predict_games returned non-list", "type": str(type(out))}
+        out = pm.predict_games(games)
+    except TypeError as te:
+        return {"enabled": True, "call_error": f"Signature issue: {te}"}
     except Exception as e:
-        return {"enabled": True, "call_error": str(e)}
+        return {"enabled": True, "call_error": f"Runtime error: {e}"}
+
+    if isinstance(out, list):
+        keys = sorted({k for r in out if isinstance(r, dict) for k in r.keys()})
+        return {"enabled": True, "count": len(out), "keys": keys, "sample": out[:max(0, limit)]}
+    return {"enabled": True, "note": "predict_games returned non-list", "type": str(type(out))}
 
 @app.get("/debug/env")
 def debug_env():
