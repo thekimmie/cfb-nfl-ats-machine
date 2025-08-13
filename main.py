@@ -586,6 +586,7 @@ async def build_rows() -> List[Dict[str, Any]]:
                 row["total_edge"] = float(row["model_total"]) - float(row["sportsbook_total"])
         except Exception:
             pass
+            
 
         # ---------- Weather (auto venue resolution) ----------
         venue_lat = (s or {}).get("venue_lat")
@@ -622,6 +623,23 @@ async def build_rows() -> List[Dict[str, Any]]:
 
     cache_set("model_data_rows", rows)
     return rows
+
+def implied_prob(american):
+    if american is None: return None
+    x = float(american)
+    return 100.0/(x+100.0) if x > 0 else (-x)/((-x)+100.0)
+
+# Derive Over/Under pick if not supplied (or always overwrite if you prefer)
+if row.get("model_total") is not None and row.get("sportsbook_total") is not None:
+    mt = float(row["model_total"]); bt = float(row["sportsbook_total"])
+    row["total_edge"] = mt - bt if row.get("total_edge") is None else row["total_edge"]
+    if row.get("ou_pick") is None:
+        row["ou_pick"] = f"{'Over' if mt > bt else 'Under'} {bt}"
+
+# Derive ML value flag if you have model probabilities
+if row.get("model_ml_prob_home") is not None and row.get("sportsbook_ml_odds_home") is not None:
+    imp = implied_prob(row["sportsbook_ml_odds_home"])
+    row["ml_value_flag"] = (float(row["model_ml_prob_home"]) > imp)
 
 # -------------------- Routes --------------------
 @app.get("/")
