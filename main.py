@@ -136,6 +136,19 @@ def synth_row_key(league: Optional[str], game_time: Optional[str], away: Optiona
     h = (home or "").lower().replace(" ", "")
     return f"{lg}|{iso_dt}|{a}@{h}"
 
+# ---- small helpers (place near other helpers) ----
+def _to_float(v):
+    try:
+        if v is None or v == "": return None
+        return float(v)
+    except Exception:
+        return None
+
+def _to_bool(v):
+    if isinstance(v, bool): return v
+    if v is None: return None
+    return str(v).strip().lower() in ("1","true","yes","y","t")
+
 # -------------------- History loader (optional) --------------------
 def _csv_to_dicts(text: str) -> List[Dict[str, Any]]:
     return [row for row in csv.DictReader(io.StringIO(text))]
@@ -611,3 +624,26 @@ async def health():
 @app.get("/version")
 async def version():
     return {"model": "lr_v1", "features": 18, "source": "odds+slate+weather(+model?)", "ttl_seconds": CACHE_TTL}
+
+# Show next 14 days of slates from API-SPORTS and how many have venue coords
+@app.get("/debug/slates")
+async def debug_slates():
+    today = datetime.utcnow().date()
+    tasks = [fetch_slates_api_sports_by_date((today + timedelta(days=i)).isoformat()) for i in range(14)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    rows = []
+    for res in results:
+        if isinstance(res, list):
+            rows.extend(res)
+    with_coords = [r for r in rows if r.get("venue_lat") is not None and r.get("venue_lon") is not None]
+    return {
+        "total_slates": len(rows),
+        "with_coords": len(with_coords),
+        "sample": rows[:3],
+        "sample_with_coords": with_coords[:3]
+    }
+
+@app.post("/admin/refresh")
+def admin_refresh():
+    _cache.clear()
+    return {"ok": True, "cleared_keys": True}
