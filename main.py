@@ -1,6 +1,6 @@
 # main.py — Betting Machine API (FastAPI on Render)
 
-import os, re, io, csv, json, time, logging, asyncio
+import os, re, io, csv, json, time, logging, asyncio, importlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
@@ -10,23 +10,27 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 # -------------------- Config / Env --------------------
-ODDS_API_KEY   = os.getenv("ODDS_API_KEY")                  # The Odds API
-APISPORTS_KEY  = os.getenv("APISPORTS_KEY")                 # API-SPORTS (RapidAPI) for slates/injuries
-CFBD_KEY       = os.getenv("CFBD_KEY")                      # CollegeFootballData (CFB venues)
-TIO_API_KEY    = os.getenv("TIO_API_KEY")                   # Tomorrow.io Timeline
-CACHE_TTL      = int(os.getenv("CACHE_TTL", "600"))         # seconds
+ODDS_API_KEY   = os.getenv("ODDS_API_KEY")
+APISPORTS_KEY  = os.getenv("APISPORTS_KEY")
+CFBD_KEY       = os.getenv("CFBD_KEY")
+TIO_API_KEY    = os.getenv("TIO_API_KEY")
+CACHE_TTL      = int(os.getenv("CACHE_TTL", "600"))
 CORS_ORIGIN    = [o.strip() for o in os.getenv("CORS_ORIGIN", "*").split(",")]
 LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO")
 
-# Optional: historical data passthrough (CSV/JSON)
-HIST_SOURCE = os.getenv("HIST_SOURCE", "none").lower()      # "file" | "url" | "none"
-HIST_PATH   = os.getenv("HIST_PATH")                        # e.g. data/history.csv
-HIST_URL    = os.getenv("HIST_URL")                         # e.g. https://raw.githubusercontent.com/.../history.csv
+# Optional: historical passthrough
+HIST_SOURCE = os.getenv("HIST_SOURCE", "none").lower()
+HIST_PATH   = os.getenv("HIST_PATH")
+HIST_URL    = os.getenv("HIST_URL")
 
-# Optional: model output (CSV/JSON) to merge into rows
-MODEL_SOURCE = os.getenv("MODEL_SOURCE", "none").lower()    # "file" | "url" | "none"
-MODEL_PATH   = os.getenv("MODEL_PATH")                      # e.g. data/model_output.csv / .json
-MODEL_URL    = os.getenv("MODEL_URL")                       # e.g. https://raw.githubusercontent.com/.../model_output.json
+# Optional: model output file merge (CSV/JSON)
+MODEL_SOURCE = os.getenv("MODEL_SOURCE", "none").lower()
+MODEL_PATH   = os.getenv("MODEL_PATH")
+MODEL_URL    = os.getenv("MODEL_URL")
+
+# NEW: optional Python plugin for real-time inference (your .pkl)
+# Example: MODEL_PLUGIN="model_adapter"
+MODEL_PLUGIN = os.getenv("MODEL_PLUGIN", "none")
 
 # Odds window
 DAYS_BACK  = int(os.getenv("DAYS_BACK",  "1"))
@@ -135,7 +139,7 @@ def nearest_hour_point(points: List[Dict[str, Any]], kickoff_iso: str) -> Option
 def compute_weather_alert(values: Dict[str, Any]) -> Optional[bool]:
     if not values: return None
     gust = float(values.get("windGust") or 0)
-    precipType = int(values.get("precipitationType") or 0)  # 0=none
+    precipType = int(values.get("precipitationType") or 0)
     precipInt = float(values.get("precipitationIntensity") or 0)
     temp = float(values.get("temperature") or 60)
     return bool(gust >= 25 or (precipType > 0 and precipInt >= 0.1) or temp <= 20 or temp >= 95)
@@ -174,7 +178,7 @@ def synth_row_key(league: Optional[str], game_time: Optional[str], away: Optiona
 NUM_FIELDS = [
     "model_spread","model_total","confidence_pct","ou_confidence_pct",
     "model_ml_prob_home","model_ml_prob_away","volatility_score",
-    "edge_vs_line","total_edge"  # include edges too
+    "edge_vs_line","total_edge"
 ]
 BOOL_FIELDS = ["ml_value_flag","trap_alert","sharp_flag","weather_alert"]
 
@@ -187,17 +191,14 @@ def _to_boolish(v):
     return None
 
 def coerce_types(row: Dict[str, Any]):
-    # blank strings -> None, then cast numerics; coerce booleans
     for f in NUM_FIELDS:
         if f in row:
             v = row[f]
             if isinstance(v, str) and v.strip() == "":
                 row[f] = None
             elif v is not None:
-                try:
-                    row[f] = float(v)
-                except:
-                    pass
+                try: row[f] = float(v)
+                except: pass
     for f in BOOL_FIELDS:
         if f in row:
             row[f] = _to_boolish(row[f])
@@ -242,7 +243,7 @@ async def load_history_rows():
     cache_set("history_rows", rows)
     return rows
 
-# -------------------- Model loader (optional merge) --------------------
+# -------------------- Model loader (CSV/JSON merge) --------------------
 async def _model_load_from_url(url: str):
     try:
         async with httpx.AsyncClient(timeout=30) as c:
@@ -353,46 +354,33 @@ async def fetch_all_odds() -> List[Dict[str, Any]]:
     for sk, res in zip(SPORT_KEYS, results):
         if isinstance(res, Exception):
             had_error = True
-            log.error("Odds fetch failed for %s: %s", sk, res)
+            logging.error("Odds fetch failed for %s: %s", sk, res)
             continue
         if not res:
-            log.warning("Odds fetch returned 0 events for %s in window %s → %s", sk, start_iso, end_iso)
+            logging.warning("Odds fetch returned 0 events for %s in window %s → %s", sk, start_iso, end_iso)
         out.extend(res)
 
     if not out and had_error:
         raise HTTPException(status_code=502, detail="All odds fetches failed; check /debug/odds")
-
     return out
 
 async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]:
-    """
-    API-SPORTS (American Football) via RapidAPI.
-    GET https://api-american-football.p.rapidapi.com/games?date=YYYY-MM-DD
-    Normalizes date to ISO string so our join_key matches Odds API commence_time.
-    """
     def _flatten_dt(raw):
-        # raw might be str, or dict {timezone,date,time,timestamp}
-        if not raw:
-            return None
+        if not raw: return None
         if isinstance(raw, str):
-            try:
-                return parse_iso(raw).isoformat().replace("+00:00","Z")
+            try: return parse_iso(raw).isoformat().replace("+00:00","Z")
             except Exception:
-                if len(raw) == 10:
-                    return f"{raw}T00:00:00Z"
+                if len(raw) == 10: return f"{raw}T00:00:00Z"
                 return raw
         if isinstance(raw, dict):
             ts = raw.get("timestamp")
             if ts is not None:
                 try:
                     return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat().replace("+00:00","Z")
-                except Exception:
-                    pass
+                except Exception: pass
             d, t = raw.get("date"), raw.get("time")
-            if d and t:
-                return f"{d}T{t}:00Z" if len(t) == 5 else f"{d}T{t}Z"
-            if d:
-                return f"{d}T00:00:00Z"
+            if d and t: return f"{d}T{t}:00Z" if len(t)==5 else f"{d}T{t}Z"
+            if d: return f"{d}T00:00:00Z"
         return None
 
     key = APISPORTS_KEY or os.getenv("RAPIDAPI_KEY")
@@ -400,7 +388,6 @@ async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]
         return []
     headers = {"X-RapidAPI-Key": key, "X-RapidAPI-Host": APISPORTS_HOST}
     params = {"date": date_ymd}
-
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.get(f"{APISPORTS_BASE}/games", headers=headers, params=params)
         if r.status_code >= 400:
@@ -411,20 +398,15 @@ async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]
             league = (g.get("league") or {}).get("name") or g.get("league")
             season = (g.get("league") or {}).get("season") or g.get("season")
             week   = (g.get("week") or {}).get("number") or g.get("week")
-
             raw_dt = g.get("date") or (g.get("game") or {}).get("date") or (g.get("fixture") or {}).get("date")
             dt_iso = _flatten_dt(raw_dt)
-
             teams = g.get("teams") or {}
             home = (teams.get("home") or {}).get("name") or g.get("home")
             away = (teams.get("away") or {}).get("name") or g.get("away")
-
             venue = (g.get("game") or {}).get("venue") or g.get("venue") or {}
             lat = (venue.get("coordinates") or {}).get("latitude") or venue.get("lat")
             lon = (venue.get("coordinates") or {}).get("longitude") or venue.get("lon")
-
             game_id = g.get("id") or (g.get("game") or {}).get("id") or (g.get("fixture") or {}).get("id")
-
             rows.append({
                 "source": "api-sports",
                 "league": league, "season": season, "week": week,
@@ -480,6 +462,43 @@ async def get_weather_points(lat: float, lon: float, start_iso: str, end_iso: st
         hourly = next((x.get("intervals", []) for x in data if x.get("timestep")=="1h"), [])
         return hourly
 
+# -------------------- Plugin loader --------------------
+_plugin_module = None
+_plugin_status = {"loaded": False, "name": None, "error": None}
+
+def _load_plugin():
+    global _plugin_module
+    if _plugin_module or MODEL_PLUGIN in ("", "none", None):
+        return
+    try:
+        _plugin_module = importlib.import_module(MODEL_PLUGIN)
+        _plugin_status.update({"loaded": True, "name": MODEL_PLUGIN, "error": None})
+        logging.info("MODEL_PLUGIN loaded: %s", MODEL_PLUGIN)
+    except Exception as e:
+        _plugin_status.update({"loaded": False, "name": MODEL_PLUGIN, "error": str(e)})
+        logging.warning("MODEL_PLUGIN failed: %s -> %s", MODEL_PLUGIN, e)
+
+async def _plugin_predict(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Calls plugin if present. Expects plugin function:
+      predict_for_games(games: List[Dict[str,Any]]) -> Dict[join_key, Dict[model_fields]]
+    """
+    _load_plugin()
+    if not (_plugin_module and getattr(_plugin_module, "predict_for_games", None)):
+        return {}
+    try:
+        # Plugin returns a dict keyed by our join_key
+        out = await _maybe_await(_plugin_module.predict_for_games(rows))
+        return out if isinstance(out, dict) else {}
+    except Exception as e:
+        logging.warning("MODEL_PLUGIN predict failed: %s", e)
+        return {}
+
+async def _maybe_await(x):
+    if asyncio.iscoroutine(x):
+        return await x
+    return x
+
 # -------------------- Core: build unified rows --------------------
 def pick_outcome(market: Optional[Dict[str, Any]], name: str) -> Dict[str, Any]:
     return next((o for o in (market or {}).get("outcomes", []) if o.get("name")==name), {})
@@ -492,7 +511,7 @@ async def build_rows() -> List[Dict[str, Any]]:
     # 1) Odds (NFL + NCAAF)
     odds = await fetch_all_odds()
 
-    # 2) Slates for next 7 days (for season/week/venues; optional)
+    # 2) Slates (next 7 days)
     today = datetime.utcnow().date()
     slate_rows: List[Dict[str, Any]] = []
     try:
@@ -508,7 +527,7 @@ async def build_rows() -> List[Dict[str, Any]]:
         for g in slate_rows
     }
 
-    # 3) Model rows (optional)
+    # 3) Model rows from CSV/JSON (optional)
     model_rows = await load_model_rows()
     model_idx = {
         join_key(m.get("league"), m.get("game_time"), m.get("away_team"), m.get("home_team")): m
@@ -519,6 +538,8 @@ async def build_rows() -> List[Dict[str, Any]]:
     cfbd_map = await fetch_cfbd_venues_map()
 
     rows: List[Dict[str, Any]] = []
+    pre_plugin_rows: List[Dict[str, Any]] = []
+
     for ev in odds:
         lg = league_label_from_odds_key(ev.get("sport_key") or ev.get("sport_title", ""))
         if not lg:
@@ -554,7 +575,7 @@ async def build_rows() -> List[Dict[str, Any]]:
             "sportsbook_ml_odds_away": ml_away.get("price"),
             "book_spread": bk_spread, "book_total": bk_total, "book_h2h": bk_h2h,
 
-            # model fields (populated from model file if provided)
+            # model fields (merge from file and/or plugin below)
             "model_spread": None, "model_total": None, "model_pick": None,
             "confidence_pct": None, "edge_vs_line": None,
             "ou_pick": None, "ou_confidence_pct": None, "total_edge": None,
@@ -571,7 +592,7 @@ async def build_rows() -> List[Dict[str, Any]]:
             row["season"] = s.get("season")
             row["week"]   = s.get("week")
 
-        # merge model fields (if any)
+        # merge model fields from CSV/JSON if any
         m = model_idx.get(k)
         if m:
             for fld in [
@@ -583,39 +604,18 @@ async def build_rows() -> List[Dict[str, Any]]:
                 if m.get(fld) is not None:
                     row[fld] = m[fld]
 
-        # compute edges if inputs exist and model didn't provide them (handle blank strings)
-        try:
-            if (row.get("model_spread") is not None
-                and row.get("sportsbook_spread") is not None
-                and row.get("edge_vs_line") in (None, "", "NaN")):
-                row["edge_vs_line"] = float(row["model_spread"]) - float(row["sportsbook_spread"])
-        except Exception:
-            pass
-        try:
-            if (row.get("model_total") is not None
-                and row.get("sportsbook_total") is not None
-                and row.get("total_edge") in (None, "", "NaN")):
-                row["total_edge"] = float(row["model_total"]) - float(row["sportsbook_total"])
-        except Exception:
-            pass
-
         # ---------- Weather (venue resolution) ----------
         venue_lat = (s or {}).get("venue_lat")
         venue_lon = (s or {}).get("venue_lon")
-
-        # NCAA fallback via CFBD school mapping
         if (venue_lat is None or venue_lon is None) and lg == "NCAA" and CFBD_KEY:
             m_school = cfbd_map.get(f"school::{(home or '').lower()}")
             if m_school:
                 venue_lat, venue_lon = m_school["lat"], m_school["lon"]
-
-        # NFL fallback via static stadium map
         if (venue_lat is None or venue_lon is None) and lg == "NFL":
             st = NFL_STADIUMS.get(home or "")
             if st:
                 venue_lat, venue_lon = st["lat"], st["lon"]
 
-        # if we have coords + kickoff, pull a timeline slice and compute alert
         if venue_lat is not None and venue_lon is not None and commence_time:
             k_dt = parse_iso(commence_time)
             win_start = iso((k_dt - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0))
@@ -627,15 +627,42 @@ async def build_rows() -> List[Dict[str, Any]]:
                 row["weather_alert"] = compute_weather_alert(values)
                 row["weather_snapshot"] = values
             except Exception as e:
-                log.warning("Weather fetch failed for %s @ %s: %s", lg, commence_time, e)
+                logging.warning("Weather fetch failed for %s @ %s: %s", lg, commence_time, e)
 
-        # stable primary key for Retool tables
+        # primary key for UI
         row["row_key"] = row.get("game_id") or synth_row_key(lg, commence_time, away, home)
 
-        # normalize types at the very end (turn "74" -> 74.0, "false" -> False, "" -> None, etc.)
+        # normalize types (turn "74"->74.0, ""->None, "false"->False)
         coerce_types(row)
 
         rows.append(row)
+        pre_plugin_rows.append({**row})  # snapshot for plugin features
+
+    # ---------- Plugin inference (real model) ----------
+    plugin_overrides = await _plugin_predict(pre_plugin_rows)
+    if plugin_overrides:
+        # create index on current rows
+        rows_by_key = {
+            join_key(r["league"], r["game_time"], r["away_team"], r["home_team"]): r
+            for r in rows
+        }
+        for k, md in plugin_overrides.items():
+            r = rows_by_key.get(k)
+            if not r: continue
+            if isinstance(md, dict):
+                # merge fields from plugin
+                for fld, val in md.items():
+                    r[fld] = val
+                # re-coerce types & compute edges if missing
+                coerce_types(r)
+                try:
+                    if r.get("model_spread") is not None and r.get("sportsbook_spread") is not None and r.get("edge_vs_line") in (None, "", "NaN"):
+                        r["edge_vs_line"] = float(r["model_spread"]) - float(r["sportsbook_spread"])
+                except: pass
+                try:
+                    if r.get("model_total") is not None and r.get("sportsbook_total") is not None and r.get("total_edge") in (None, "", "NaN"):
+                        r["total_edge"] = float(r["model_total"]) - float(r["sportsbook_total"])
+                except: pass
 
     cache_set("model_data_rows", rows)
     return rows
@@ -646,7 +673,7 @@ async def root():
     start_iso, end_iso = current_window()
     return {
         "ok": True,
-        "endpoints": ["/health", "/version", "/api/model-data", "/api/history", "/api/model/debug", "/debug/env", "/debug/odds", "/debug/slates", "/debug/coverage"],
+        "endpoints": ["/health", "/version", "/api/model-data", "/api/history", "/api/model/debug", "/debug/env", "/debug/odds", "/debug/slates", "/debug/coverage", "/debug/plugin"],
         "window": {"from": start_iso, "to": end_iso}
     }
 
@@ -726,7 +753,6 @@ async def debug_odds():
                 results[sk] = {"error": str(e)}
     return {"window": {"from": start_iso, "to": end_iso}, "results": results}
 
-# Show next 14 days of slates from API-SPORTS and how many have venue coords
 @app.get("/debug/slates")
 async def debug_slates():
     today = datetime.utcnow().date()
@@ -737,20 +763,20 @@ async def debug_slates():
         if isinstance(res, list):
             rows.extend(res)
     with_coords = [r for r in rows if r.get("venue_lat") is not None and r.get("venue_lon") is not None]
-    return {
-        "total_slates": len(rows),
-        "with_coords": len(with_coords),
-        "sample": rows[:3],
-        "sample_with_coords": with_coords[:3]
-    }
+    return {"total_slates": len(rows), "with_coords": len(with_coords), "sample": rows[:3], "sample_with_coords": with_coords[:3]}
 
-# Model coverage: how many odds rows matched a model row
 @app.get("/debug/coverage")
 async def debug_coverage():
     rows = await build_rows()
     total = len(rows)
     with_model = sum(1 for r in rows if r.get("model_spread") is not None or r.get("model_total") is not None or r.get("model_pick") not in (None, ""))
     return {"total_rows": total, "rows_with_any_model_field": with_model}
+
+# NEW: plugin status debug
+@app.get("/debug/plugin")
+async def debug_plugin():
+    _load_plugin()
+    return _plugin_status
 
 @app.post("/admin/refresh")
 def admin_refresh():
