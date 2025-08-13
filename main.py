@@ -41,6 +41,41 @@ TIO_URL         = "https://api.tomorrow.io/v4/timelines"
 
 SPORT_KEYS = ["americanfootball_nfl", "americanfootball_ncaaf"]
 
+# Minimal NFL stadium map (home team -> lat/lon). Good enough for weather alerts.
+NFL_STADIUMS = {
+    "Arizona Cardinals": {"lat": 33.5276, "lon": -112.2626},      # State Farm Stadium
+    "Atlanta Falcons": {"lat": 33.7554, "lon": -84.4008},         # Mercedes-Benz Stadium
+    "Baltimore Ravens": {"lat": 39.2780, "lon": -76.6227},        # M&T Bank Stadium
+    "Buffalo Bills": {"lat": 42.7738, "lon": -78.7869},           # Highmark Stadium
+    "Carolina Panthers": {"lat": 35.2251, "lon": -80.8526},       # Bank of America Stadium
+    "Chicago Bears": {"lat": 41.8625, "lon": -87.6166},           # Soldier Field
+    "Cincinnati Bengals": {"lat": 39.0954, "lon": -84.5160},      # Paycor Stadium
+    "Cleveland Browns": {"lat": 41.5061, "lon": -81.6995},        # Cleveland Browns Stadium
+    "Dallas Cowboys": {"lat": 32.7473, "lon": -97.0945},          # AT&T Stadium
+    "Denver Broncos": {"lat": 39.7439, "lon": -105.0201},         # Empower Field at Mile High
+    "Detroit Lions": {"lat": 42.3400, "lon": -83.0456},           # Ford Field
+    "Green Bay Packers": {"lat": 44.5013, "lon": -88.0622},       # Lambeau Field
+    "Houston Texans": {"lat": 29.6847, "lon": -95.4107},          # NRG Stadium
+    "Indianapolis Colts": {"lat": 39.7601, "lon": -86.1639},      # Lucas Oil Stadium
+    "Jacksonville Jaguars": {"lat": 30.3239, "lon": -81.6373},    # EverBank Stadium
+    "Kansas City Chiefs": {"lat": 39.0489, "lon": -94.4839},      # GEHA Field at Arrowhead
+    "Las Vegas Raiders": {"lat": 36.0909, "lon": -115.1833},      # Allegiant Stadium
+    "Los Angeles Chargers": {"lat": 33.9530, "lon": -118.3390},   # SoFi Stadium (approx)
+    "Los Angeles Rams": {"lat": 33.9530, "lon": -118.3390},       # SoFi Stadium (approx)
+    "Miami Dolphins": {"lat": 25.9580, "lon": -80.2389},          # Hard Rock Stadium
+    "Minnesota Vikings": {"lat": 44.9736, "lon": -93.2575},       # U.S. Bank Stadium
+    "New England Patriots": {"lat": 42.0909, "lon": -71.2643},    # Gillette Stadium
+    "New Orleans Saints": {"lat": 29.9509, "lon": -90.0815},      # Caesars Superdome
+    "New York Giants": {"lat": 40.8135, "lon": -74.0745},         # MetLife Stadium
+    "New York Jets": {"lat": 40.8135, "lon": -74.0745},           # MetLife Stadium
+    "Philadelphia Eagles": {"lat": 39.9008, "lon": -75.1675},     # Lincoln Financial Field
+    "Pittsburgh Steelers": {"lat": 40.4468, "lon": -80.0158},     # Acrisure Stadium
+    "San Francisco 49ers": {"lat": 37.4030, "lon": -121.9700},    # Levi's Stadium
+    "Seattle Seahawks": {"lat": 47.5952, "lon": -122.3316},       # Lumen Field
+    "Tampa Bay Buccaneers": {"lat": 27.9759, "lon": -82.5033},    # Raymond James Stadium
+    "Tennessee Titans": {"lat": 36.1665, "lon": -86.7713},        # Nissan Stadium
+    "Washington Commanders": {"lat": 38.9078, "lon": -76.8646},   # FedEx Field (approx)
+}
 # -------------------- App / CORS / Logging --------------------
 app = FastAPI()
 app.add_middleware(
@@ -312,11 +347,44 @@ async def fetch_all_odds() -> List[Dict[str, Any]]:
     return out
 
 async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]:
+    """
+    API-SPORTS (American Football) via RapidAPI.
+    GET https://api-american-football.p.rapidapi.com/games?date=YYYY-MM-DD
+    Normalizes date to ISO string so our join_key matches Odds API commence_time.
+    """
+    def _flatten_dt(raw):
+        # raw might be str, or dict {timezone,date,time,timestamp}
+        if not raw:
+            return None
+        if isinstance(raw, str):
+            # assume already ISO-ish
+            try:
+                return parse_iso(raw).isoformat().replace("+00:00","Z")
+            except Exception:
+                # best effort, add Z if just 'YYYY-MM-DD'
+                if len(raw) == 10:
+                    return f"{raw}T00:00:00Z"
+                return raw
+        if isinstance(raw, dict):
+            ts = raw.get("timestamp")
+            if ts is not None:
+                try:
+                    return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat().replace("+00:00","Z")
+                except Exception:
+                    pass
+            d, t = raw.get("date"), raw.get("time")
+            if d and t:
+                return f"{d}T{t}:00Z" if len(t) == 5 else f"{d}T{t}Z"
+            if d:
+                return f"{d}T00:00:00Z"
+        return None
+
     key = APISPORTS_KEY or os.getenv("RAPIDAPI_KEY")
     if not key:
         return []
     headers = {"X-RapidAPI-Key": key, "X-RapidAPI-Host": APISPORTS_HOST}
     params = {"date": date_ymd}
+
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.get(f"{APISPORTS_BASE}/games", headers=headers, params=params)
         if r.status_code >= 400:
@@ -327,18 +395,26 @@ async def fetch_slates_api_sports_by_date(date_ymd: str) -> List[Dict[str, Any]]
             league = (g.get("league") or {}).get("name") or g.get("league")
             season = (g.get("league") or {}).get("season") or g.get("season")
             week   = (g.get("week") or {}).get("number") or g.get("week")
-            game_id = g.get("id") or (g.get("game") or {}).get("id") or (g.get("fixture") or {}).get("id")
-            dt = g.get("date") or (g.get("game") or {}).get("date") or (g.get("fixture") or {}).get("date")
+
+            # raw date shapes can vary across API-SPORTS payloads
+            raw_dt = g.get("date") or (g.get("game") or {}).get("date") or (g.get("fixture") or {}).get("date")
+            dt_iso = _flatten_dt(raw_dt)
+
             teams = g.get("teams") or {}
             home = (teams.get("home") or {}).get("name") or g.get("home")
             away = (teams.get("away") or {}).get("name") or g.get("away")
+
             venue = (g.get("game") or {}).get("venue") or g.get("venue") or {}
+            # these are often missing for football; we’ll keep them if present
             lat = (venue.get("coordinates") or {}).get("latitude") or venue.get("lat")
             lon = (venue.get("coordinates") or {}).get("longitude") or venue.get("lon")
+
+            game_id = g.get("id") or (g.get("game") or {}).get("id") or (g.get("fixture") or {}).get("id")
+
             rows.append({
                 "source": "api-sports",
                 "league": league, "season": season, "week": week,
-                "game_id": game_id, "game_time": dt,
+                "game_id": game_id, "game_time": dt_iso,
                 "home_team": home, "away_team": away,
                 "venue_lat": lat, "venue_lon": lon,
             })
@@ -391,6 +467,7 @@ async def get_weather_points(lat: float, lon: float, start_iso: str, end_iso: st
         return hourly
 
 # -------------------- Core: build unified rows --------------------
+
 async def build_rows() -> List[Dict[str, Any]]:
     cached = cache_get("model_data_rows")
     if cached is not None:
@@ -531,6 +608,21 @@ async def build_rows() -> List[Dict[str, Any]]:
     cache_set("model_data_rows", rows)
     return rows
 
+# ---------- Weather (auto venue resolution) ----------
+venue_lat = (s or {}).get("venue_lat")
+venue_lon = (s or {}).get("venue_lon")
+
+# NCAA fallback via CFBD school mapping (you already have this)
+if (venue_lat is None or venue_lon is None) and lg == "NCAA" and CFBD_KEY:
+    m = cfbd_map.get(f"school::{(home or '').lower()}")
+    if m:
+        venue_lat, venue_lon = m["lat"], m["lon"]
+
+# NEW: NFL fallback via static stadium map
+if (venue_lat is None or venue_lon is None) and lg == "NFL":
+    st = NFL_STADIUMS.get(home or "")
+    if st:
+        venue_lat, venue_lon = st["lat"], st["lon"]
 # -------------------- Routes --------------------
 @app.get("/")
 async def root():
