@@ -1,6 +1,6 @@
 # main.py — Betting Machine API (FastAPI on Render)
 
-import os, re, io, csv, json, time, logging, asyncio, importlib.util, sys
+import os, re, io, csv, json, time, logging, asyncio, importlib, importlib.util
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
@@ -314,29 +314,48 @@ async def load_model_rows():
     return normed
 
 # -------------------- Script Model loader (predict.py) --------------------
-_predict_module = None
+_predict_module: Optional[Any] = None
+_predict_name = "user_predict"
 
-def get_predict_module():
-    """Dynamically import the user's predict.py when MODEL_SOURCE=script."""
+def load_predict_module(reload: bool = False):
+    """Import predict.py for MODEL_SOURCE=script. If MODEL_PATH is set, load from that path.
+       Otherwise try regular 'predict' module in PYTHONPATH. Pass reload=1 to hot-reload."""
     global _predict_module
+
+    if MODEL_SOURCE != "script":
+        _predict_module = None
+        return None
+
+    if reload:
+        _predict_module = None
+
     if _predict_module is not None:
         return _predict_module
-    if MODEL_SOURCE != "script" or not MODEL_PATH:
-        _predict_module = None
-        return None
-    spec = importlib.util.spec_from_file_location("user_predict", MODEL_PATH)
-    if spec is None or spec.loader is None:
-        _predict_module = None
-        return None
-    mod = importlib.util.module_from_spec(spec)
+
+    # Load from explicit file path if provided
+    if MODEL_PATH and Path(MODEL_PATH).is_file():
+        spec = importlib.util.spec_from_file_location(_predict_name, MODEL_PATH)
+        if not spec or not spec.loader:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(mod)
+            _predict_module = mod
+            return _predict_module
+        except Exception as e:
+            log.error("Failed to import script model at %s: %s", MODEL_PATH, e)
+            return None
+
+    # Fallback: import by module name 'predict'
     try:
-        spec.loader.exec_module(mod)
+        mod = importlib.import_module("predict")
+        if reload:
+            mod = importlib.reload(mod)
+        _predict_module = mod
+        return _predict_module
     except Exception as e:
-        log.error("Failed to import predict script at %s: %s", MODEL_PATH, e)
-        _predict_module = None
+        log.error("Failed to import 'predict' module: %s", e)
         return None
-    _predict_module = mod
-    return mod
 
 # -------------------- Odds / Slates / Weather adapters --------------------
 PREFERRED_BOOKS = ["pinnacle","circa","bookmaker","draftkings","fanduel","betmgm"]
@@ -660,7 +679,7 @@ async def build_rows() -> List[Dict[str, Any]]:
         rows.append(row)
 
     # --- Run script model if available (MODEL_SOURCE=script) ---
-    pm = get_predict_module()
+    pm = load_predict_module(reload=False)
     if pm and hasattr(pm, "predict_games"):
         try:
             inputs = [{
@@ -674,7 +693,12 @@ async def build_rows() -> List[Dict[str, Any]]:
                 "sportsbook_ml_odds_away": r.get("sportsbook_ml_odds_away"),
             } for r in rows]
 
-            preds = pm.predict_games(inputs) or []
+            try:
+                preds = pm.predict_games(inputs)  # preferred signature
+            except TypeError:
+                preds = pm.predict_games()        # fallback if script ignores inputs
+
+            preds = preds or []
             pred_idx = {
                 join_key(p.get("league"), p.get("game_time"), p.get("away_team"), p.get("home_team")): p
                 for p in preds if p.get("league") and p.get("game_time")
@@ -694,8 +718,7 @@ async def build_rows() -> List[Dict[str, Any]]:
                         r[fld] = p[fld]
                 # Re-coerce after merge
                 coerce_types(r)
-
-                # fill edges if still missing
+                # Fill edges if still missing
                 try:
                     if r.get("model_spread") is not None and r.get("sportsbook_spread") is not None and r.get("edge_vs_line") is None:
                         r["edge_vs_line"] = float(r["model_spread"]) - float(r["sportsbook_spread"])
@@ -748,14 +771,28 @@ async def api_model_debug():
         "first_row": rows[0] if rows else None
     }
 
+# ----- Script-model debug (raw output from predict.py) -----
 @app.get("/debug/model-script")
-def debug_model_script():
-    pm = get_predict_module()
-    return {
-        "enabled": MODEL_SOURCE == "script",
-        "path": MODEL_PATH,
-        "has_predict_games": bool(pm and hasattr(pm, "predict_games"))
-    }
+def debug_model_script(limit: int = 10, reload: bool = False):
+    """
+    Calls predict.predict_games() and returns a sample of raw rows.
+    Use ?reload=1 to hot-reload predict.py after edits.
+    """
+    pm = load_predict_module(reload=bool(reload))
+    if not (pm and hasattr(pm, "predict_games")):
+        return {
+            "enabled": MODEL_SOURCE == "script",
+            "path": MODEL_PATH,
+            "has_predict_games": False
+        }
+    try:
+        out = pm.predict_games()
+        if isinstance(out, list):
+            keys = sorted({k for r in out if isinstance(r, dict) for k in r.keys()})
+            return {"enabled": True, "count": len(out), "keys": keys, "sample": out[:max(0, limit)]}
+        return {"enabled": True, "note": "predict_games returned non-list", "type": str(type(out))}
+    except Exception as e:
+        return {"enabled": True, "call_error": str(e)}
 
 @app.get("/debug/env")
 def debug_env():
@@ -855,25 +892,3 @@ async def health():
 @app.get("/version")
 async def version():
     return {"model": "rf_script_or_file", "features": 18, "source": "odds+slate+weather+model", "ttl_seconds": CACHE_TTL}
-
-# ----- Script-model debug (raw output from predict.py) -----
-import importlib
-
-try:
-    _predict_mod = importlib.import_module("predict")
-    _HAS_SCRIPT_MODEL = hasattr(_predict_mod, "predict_games")
-except Exception:
-    _predict_mod = None
-    _HAS_SCRIPT_MODEL = False
-
-@app.get("/debug/model-script")
-def debug_model_script(limit: int = 10):
-    if not _HAS_SCRIPT_MODEL:
-        return {"enabled": False, "reason": "predict.predict_games() not found"}
-    try:
-        out = _predict_mod.predict_games()
-        if not isinstance(out, list):
-            return {"enabled": True, "note": "predict_games did not return a list", "type": str(type(out))}
-        return {"enabled": True, "count": len(out), "sample": out[:max(0, limit)]}
-    except Exception as e:
-        return {"enabled": True, "error": str(e)}
