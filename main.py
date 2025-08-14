@@ -172,6 +172,37 @@ def synth_row_key(league: Optional[str], game_time: Optional[str], away: Optiona
     h = (home or "").lower().replace(" ", "")
     return f"{lg}|{iso_dt}|{a}@{h}"
 
+STRING_FIELDS = [
+  "league","season","week","game_id","game_time","away_team","home_team",
+  "book_spread","book_total","book_h2h","model_pick","ou_pick","row_key"
+]
+NUM_FIELDS = [
+  "sportsbook_spread","sportsbook_total","sportsbook_ml_odds_home","sportsbook_ml_odds_away",
+  "model_spread","model_total","edge_vs_line","total_edge",
+  "model_ml_prob_home","model_ml_prob_away","confidence_pct","ou_confidence_pct","volatility_score"
+]
+BOOL_FIELDS = ["ml_value_flag","trap_alert","sharp_flag","weather_alert"]
+
+def fill_nulls_for_display(row: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(row)
+    for f in STRING_FIELDS:
+        out[f] = out.get(f) or ""
+    for f in NUM_FIELDS:
+        out[f] = "" if out.get(f) is None else out[f]
+    for f in BOOL_FIELDS:
+        out[f] = False if out.get(f) is None else out[f]
+    if not isinstance(out.get("weather_snapshot"), dict):
+        out["weather_snapshot"] = {}
+    return out
+
+def _to_boolish(v):
+    if isinstance(v, bool): return v
+    if v is None: return None
+    s = str(v).strip().lower()
+    if s in ("true","1","yes","y","t"): return True
+    if s in ("false","0","no","n","f"): return False
+    return None
+
 # ---- Type coercion for model fields ----
 NUM_FIELDS = [
     "model_spread","model_total","confidence_pct","ou_confidence_pct",
@@ -727,11 +758,17 @@ async def root():
         "window": {"from": start_iso, "to": end_iso}
     }
 
+from typing import Optional
+
 @app.get("/api/model-data")
-async def api_model_data(refresh: bool = False):
-    if refresh:
+async def api_model_data(refresh: Optional[str] = None, complete: Optional[str] = None):
+    # tolerate weird inputs like refresh=undefined
+    if _to_boolish(refresh):
         cache_clear("model_data_rows", "model_rows", "cfbd_venues")
-    return await build_rows()
+    rows = await build_rows()
+    if _to_boolish(complete):
+        rows = [fill_nulls_for_display(r) for r in rows]
+    return rows
 
 @app.get("/api/history")
 async def api_history(refresh: bool = False):
