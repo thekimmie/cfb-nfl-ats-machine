@@ -1,0 +1,16 @@
+{
+  "model_type": "LogisticRegression",
+  "task": "home_win_probability",
+  "features_used": [
+    "sportsbook_spread",
+    "sportsbook_total"
+  ],
+  "positive_class": "home",
+  "trained_rows": 3979,
+  "test_rows": 1327,
+  "metrics": {
+    "accuracy": 0.7611152976639035,
+    "roc_auc": 0.8358805367533546,
+    "brier": 0.16127612700885466
+  }
+}
