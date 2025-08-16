@@ -1,117 +1,60 @@
-# predict.py
-# ----------------------------
-# Drop-in inference-only module for NFL/CFB ATS / ML predictions.
-# - Loads a trained pickle from env MODEL_WEIGHTS_PATH (default: final_ats_model.pkl)
-# - Safe import: model is loaded lazily on first call to predict_games()
-# - No training happens here.
-#
-# I/O CONTRACT
-# def predict_games(games: list[dict]) -> list[dict]:
-#   INPUT (each game dict must include at least):
-#     league: "NFL" | "NCAA" | ...
-#     game_time: ISO8601 ("...Z")
-#     home_team: str
-#     away_team: str
-#   Optional sportsbook fields:
-#     sportsbook_ml_odds_home: int  # American odds, e.g. -150, +135
-#     sportsbook_ml_odds_away: int
-#     sportsbook_spread: float      # home perspective; negative => home favored
-#     sportsbook_total: float
-#   Optional features for your trained model (if it needs them):
-#     features: Dict[str, float]    # must match metadata['features_used'] order if provided
-#
-#   OUTPUT (one dict per input) includes keys:
-#     league, game_time, home_team, away_team
-#     model_ml_prob_home: float (0..1)
-#     model_ml_prob_away: float (0..1)
-#     model_pick: str (exactly one of the input team names)
-#     confidence_pct: float (0..100)
-#     ml_value_flag: bool
-#   Optional extras (if data present or we can infer):
-#     model_spread: float
-#     model_total: float
-#     edge_vs_line: float
-#     ou_pick: str | None
-#     ou_confidence_pct: float | None
-#     total_edge: float | None
-#     trap_alert: bool
-#     sharp_flag: bool
-#     volatility_score: float
-
+# predict.py — inference-only, robust fill
 from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
-import os, sys, json
+import os, json, math
 
 try:
-    import joblib  # preferred for sklearn models
+    import joblib
 except Exception:
     joblib = None
-import pickle  # fallback loader
+import pickle
 
-# --------- Lazy-loaded globals ---------
-_MODEL = None                 # trained estimator or pipeline with predict_proba
-_MODEL_PATH = None
-_METADATA = None              # optional dict from model_metadata.(json|txt)
-_FEATURES_USED: Optional[list] = None
-_POSITIVE_CLASS: Optional[str] = None  # "home" or "away" if provided in metadata
+# --------- Lazy globals ---------
+_MODEL = None
+_METADATA = None
+_FEATURES_USED: Optional[list] = None  # e.g. ["sportsbook_spread","sportsbook_total"]
+_POSITIVE_CLASS: Optional[str] = None  # "home" or "away"
 
-# --------- Utility functions ---------
-def _get_model_path() -> str:
+def _model_path() -> str:
     return os.getenv("MODEL_WEIGHTS_PATH", "final_ats_model.pkl")
 
-def _maybe_load_metadata() -> None:
-    """Loads model metadata if present (features_used, positive_class)."""
-    # Try JSON first
+def _metadata_path() -> str:
+    return os.getenv("MODEL_METADATA_PATH", "model_metadata.txt")
+
+def _load_metadata_once():
     global _METADATA, _FEATURES_USED, _POSITIVE_CLASS
     if _METADATA is not None:
         return
-    for meta_path in [os.getenv("MODEL_METADATA_PATH", "model_metadata.json"),
-                      os.getenv("MODEL_METADATA_PATH", "model_metadata.txt")]:
-        try:
-            if not os.path.exists(meta_path):
-                continue
-            with open(meta_path, "r") as f:
-                txt = f.read().strip()
-                # If it's JSON, parse; otherwise try to parse laxly
-                try:
-                    md = json.loads(txt)
-                except Exception:
-                    # lax: try to coerce to JSON-ish
-                    txt2 = txt.replace("'", '"')
-                    md = json.loads(txt2)
-            if isinstance(md, dict):
-                _METADATA = md
-                if isinstance(md.get("features_used"), list):
-                    _FEATURES_USED = md["features_used"]
-                pc = md.get("positive_class")
-                if isinstance(pc, str) and pc.lower() in ("home", "away"):
-                    _POSITIVE_CLASS = pc.lower()
-                return
-        except Exception:
-            continue
     _METADATA = {}
+    try:
+        p = _metadata_path()
+        if os.path.exists(p):
+            with open(p, "r") as f:
+                _METADATA = json.load(f) or {}
+    except Exception:
+        _METADATA = {}
+    _FEATURES_USED = _METADATA.get("features_used")
+    _POSITIVE_CLASS = (_METADATA.get("positive_class") or "home").lower()
 
-def _load_model_once() -> None:
-    """Lazily loads the trained model from pickle."""
-    global _MODEL, _MODEL_PATH
+def _load_model_once():
+    global _MODEL
     if _MODEL is not None:
         return
-    _maybe_load_metadata()
-    _MODEL_PATH = _get_model_path()
-    if not os.path.exists(_MODEL_PATH):
+    path = _model_path()
+    if not os.path.exists(path):
         _MODEL = None
         return
     try:
         if joblib is not None:
-            _MODEL = joblib.load(_MODEL_PATH)
+            _MODEL = joblib.load(path)
         else:
-            with open(_MODEL_PATH, "rb") as f:
+            with open(path, "rb") as f:
                 _MODEL = pickle.load(f)
     except Exception:
-        _MODEL = None  # fallback math will take over
+        _MODEL = None
 
+# --------- Helpers ---------
 def american_to_prob(odds: Optional[float]) -> Optional[float]:
-    """Convert American odds to implied probability (with vig)."""
     if odds is None:
         return None
     try:
@@ -123,8 +66,7 @@ def american_to_prob(odds: Optional[float]) -> Optional[float]:
     else:
         return (-o) / ((-o) + 100.0)
 
-def normalize_no_vig(ph: Optional[float], pa: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
-    """Remove vig by normalizing two implied probs to sum to 1."""
+def normalize_two(ph: Optional[float], pa: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
     if ph is None and pa is None:
         return None, None
     if ph is None:
@@ -137,256 +79,182 @@ def normalize_no_vig(ph: Optional[float], pa: Optional[float]) -> Tuple[Optional
     return ph / s, pa / s
 
 def league_spread_scale(league: str) -> float:
-    """Heuristic mapping from ML probability deltas to spread points."""
     lg = (league or "").upper()
-    if lg == "NFL":
-        return 18.0
-    if lg in ("CFB", "NCAA", "NCAAF", "NCAAFB"):
-        return 22.0
+    if lg == "NFL": return 18.0
+    if lg in ("CFB","NCAAF"): return 22.0
     return 20.0
 
 def prob_to_home_spread(p_home: float, league: str) -> float:
-    """Convert home ML prob into a model home spread (negative => home favored)."""
+    # negative spread => home favored
     scale = league_spread_scale(league)
     return - (p_home - 0.5) * 2.0 * scale
 
-def spread_to_prob_home(home_spread: float, league: str) -> float:
-    """Inverse of prob_to_home_spread (approx)."""
+def spread_to_prob_home(spread_home: float, league: str) -> float:
+    # invert of prob_to_home_spread; if home spread is -3, p_home > 0.5
     scale = league_spread_scale(league)
-    return 0.5 - (float(home_spread) / (2.0 * scale))
+    return 0.5 - (spread_home / (2.0 * scale))
 
-def compute_confidence_from_edge(edge_vs_line: Optional[float], league: str) -> float:
-    """Map spread edge to a confidence percentage (caps below 100)."""
-    if edge_vs_line is None:
-        return 50.0
-    denom = 8.0 if (league or "").upper() == "NFL" else 10.0
-    # Edge of denom points ~ 75% confidence; capped around 98%
-    pct = 50.0 + min(abs(edge_vs_line) / denom * 25.0, 48.0)
-    return round(pct, 1)
+def confidence_from_edge(edge_vs_line: Optional[float], league: str, p_home: Optional[float]) -> float:
+    # If we have an edge, scale confidence by its magnitude; else fallback to distance from 0.5
+    if edge_vs_line is not None:
+        denom = 8.0 if (league or "").upper() == "NFL" else 10.0
+        base = min(abs(edge_vs_line) / denom, 0.48)  # cap near 48 points → 98%
+        return round((0.5 + base) * 100.0, 1)
+    if p_home is not None:
+        return round((0.5 + min(abs(p_home - 0.5) * 2.0, 0.48)) * 100.0, 1)
+    return 50.0
 
-def pick_side_from_probs(home: str, away: str, p_home: float) -> str:
-    return home if p_home >= 0.5 else away
+def value_flag_from_odds(p_home: Optional[float], ml_home: Optional[float], ml_away: Optional[float]) -> bool:
+    # Value if model disagree with market by >= 3 percentage points
+    if p_home is None: 
+        return False
+    ph_implied = american_to_prob(ml_home)
+    pa_implied = american_to_prob(ml_away)
+    ph_implied, pa_implied = normalize_two(ph_implied, pa_implied)
+    if ph_implied is None:
+        return False
+    return abs(p_home - ph_implied) >= 0.03
 
-def value_flag_from_probs_and_odds(
-    p_home: float,
-    odds_home: Optional[float],
-    odds_away: Optional[float],
-    threshold_pp: float = 0.03
-) -> bool:
-    """Flag 'value' if model probability beats the implied by >= threshold_pp on chosen side."""
-    # Decide side first
-    pick_home = p_home >= 0.5
-    implied_home = american_to_prob(odds_home)
-    implied_away = american_to_prob(odds_away)
-    ih, ia = normalize_no_vig(implied_home, implied_away)
-    if pick_home and ih is not None:
-        return (p_home - ih) >= threshold_pp
-    if (not pick_home) and ia is not None:
-        return ((1.0 - p_home) - ia) >= threshold_pp
-    return False
-
-def _extract_feature_vector(game: Dict[str, Any]) -> Optional[list]:
-    """
-    If metadata['features_used'] exists, try to assemble X in that order.
-    - Prefer game['features'][name], else game[name], else 0.0
-    """
-    if not _FEATURES_USED:
+def _vector_from_game(game: Dict[str, Any], features: Optional[list]) -> Optional[list]:
+    if not features:
         return None
-    feats = game.get("features") or {}
-    x = []
-    for f in _FEATURES_USED:
-        val = feats.get(f)
-        if val is None:
-            val = game.get(f)
+    vec = []
+    for f in features:
+        v = game.get(f)
+        if v is None:
+            return None
         try:
-            x.append(float(val))
+            vec.append(float(v))
         except Exception:
-            x.append(0.0)
-    return x
+            return None
+    return vec
 
-def _model_probs_for_game(game: Dict[str, Any]) -> Optional[Tuple[float, float]]:
-    """Return (p_home, p_away) from trained model if possible, else None."""
-    if _MODEL is None:
-        return None
-    # Need features (either vectorizable from metadata, or not possible)
-    x = _extract_feature_vector(game)
-    if x is None:
-        return None
-    try:
-        # scikit-learn predict_proba
-        if hasattr(_MODEL, "predict_proba"):
-            proba = _MODEL.predict_proba([x])[0]
-            # Map to home prob using classes_ if helpful
-            if hasattr(_MODEL, "classes_"):
-                classes = list(_MODEL.classes_)
-                # common patterns: ["away","home"] or ["home","away"] or [0,1]
-                if "home" in classes and "away" in classes:
-                    p_home = float(proba[classes.index("home")])
-                else:
-                    # assume class '1' == home if binary numeric
-                    p_home = float(proba[-1])
-            else:
-                p_home = float(proba[-1])
-            p_home = min(max(p_home, 0.0), 1.0)
-            return p_home, 1.0 - p_home
-        # Fallback: decision_function -> sigmoid
-        if hasattr(_MODEL, "decision_function"):
-            from math import exp
-            z = float(_MODEL.decision_function([x])[0])
-            p_home = 1.0 / (1.0 + pow(2.718281828459045, -z))
-            p_home = min(max(p_home, 0.0), 1.0)
-            return p_home, 1.0 - p_home
-    except Exception:
-        return None
-    return None
-
-def _fallback_probs(game: Dict[str, Any]) -> Tuple[float, float]:
+# --------- Main entry ---------
+def predict_games(games: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Use sportsbook ML odds (preferred) or spread to derive probabilities when no model.
+    Returns one dict per input game with:
+      model_ml_prob_home, model_ml_prob_away, model_pick, confidence_pct,
+      ml_value_flag, model_spread, edge_vs_line, (ou fields left None unless totals available).
     """
-    league = game.get("league") or ""
-    oh = game.get("sportsbook_ml_odds_home")
-    oa = game.get("sportsbook_ml_odds_away")
-    ph_raw = american_to_prob(oh)
-    pa_raw = american_to_prob(oa)
-    ph, pa = normalize_no_vig(ph_raw, pa_raw)
-    if ph is not None and pa is not None:
-        return float(ph), float(pa)
+    _load_metadata_once()
+    _load_model_once()
 
-    # Try spread
-    sp = game.get("sportsbook_spread")
-    try:
-        if sp is not None:
-            p_home = spread_to_prob_home(float(sp), league)
-            p_home = min(max(p_home, 0.0), 1.0)
-            return p_home, 1.0 - p_home
-    except Exception:
-        pass
+    out: List[Dict[str, Any]] = []
 
-    # Dead fallback
-    return 0.5, 0.5
+    for g in games:
+        league     = g.get("league") or ""
+        home       = g.get("home_team")
+        away       = g.get("away_team")
+        game_time  = g.get("game_time")
 
-def _build_output_for_game(game: Dict[str, Any]) -> Dict[str, Any]:
-    league = (game.get("league") or "").strip()
-    home = game.get("home_team")
-    away = game.get("away_team")
-    gtime = game.get("game_time")
+        # sportsbook info (may be None)
+        spread_h   = g.get("sportsbook_spread")   # home perspective
+        total_pts  = g.get("sportsbook_total")
+        ml_home    = g.get("sportsbook_ml_odds_home")
+        ml_away    = g.get("sportsbook_ml_odds_away")
 
-    # 1) Try trained model
-    p_pair = _model_probs_for_game(game)
-    if p_pair is None:
-        p_home, p_away = _fallback_probs(game)
-    else:
-        p_home, p_away = p_pair
+        # --- 1) Try model pickle first if we have all needed features
+        p_home = None
+        if _MODEL is not None and _FEATURES_USED:
+            vec = _vector_from_game(g, _FEATURES_USED)
+            if vec is not None:
+                try:
+                    import numpy as np
+                    X = np.array(vec, dtype=float, ndmin=2)
+                    # Assume positive class = "home" unless metadata says otherwise
+                    proba = getattr(_MODEL, "predict_proba", None)
+                    if callable(proba):
+                        # Most scikit models return proba for class 1 at index 1
+                        p = proba(X)[0, 1]
+                        if (_POSITIVE_CLASS or "home") == "home":
+                            p_home = float(p)
+                        else:
+                            p_home = float(1.0 - p)
+                except Exception:
+                    p_home = None
 
-    # 2) Derive model_spread from p_home
-    model_spread = prob_to_home_spread(p_home, league)  # negative => home favored
+        # --- 2) Fallback: use moneyline odds implied probabilities
+        if p_home is None:
+            ph_imp = american_to_prob(ml_home)
+            pa_imp = american_to_prob(ml_away)
+            ph_imp, pa_imp = normalize_two(ph_imp, pa_imp)
+            if ph_imp is not None:
+                p_home = ph_imp
 
-    # 3) Edge vs sportsbook line (if we have it)
-    edge_vs_line = None
-    if game.get("sportsbook_spread") is not None:
+        # --- 3) Fallback: infer from spread if still unknown
+        if p_home is None and spread_h is not None:
+            try:
+                p_home = spread_to_prob_home(float(spread_h), league)
+                p_home = max(0.01, min(0.99, p_home))
+            except Exception:
+                p_home = None
+
+        # If still None, neutral prior
+        if p_home is None:
+            p_home = 0.50
+        p_away = 1.0 - p_home
+
+        # Model pick from p_home
+        model_pick = home if p_home >= 0.5 else away
+
+        # Model-derived spread for home (negative => home favored)
+        model_spread = prob_to_home_spread(p_home, league)
+
+        # Edge if we have a sportsbook spread
+        edge_vs_line = None
         try:
-            edge_vs_line = float(model_spread) - float(game.get("sportsbook_spread"))
+            if spread_h is not None:
+                edge_vs_line = float(model_spread) - float(spread_h)
         except Exception:
             edge_vs_line = None
 
-    # 4) Confidence (spread-based if possible)
-    confidence_pct = compute_confidence_from_edge(edge_vs_line, league) if edge_vs_line is not None else round(50.0 + abs(p_home - 0.5) * 90.0, 1)
+        # Confidence
+        confidence_pct = confidence_from_edge(edge_vs_line, league, p_home)
 
-    # 5) Pick + value flag
-    pick = pick_side_from_probs(home, away, p_home)
-    ml_value_flag = value_flag_from_probs_and_odds(
-        p_home,
-        game.get("sportsbook_ml_odds_home"),
-        game.get("sportsbook_ml_odds_away"),
-        threshold_pp=0.03,  # 3 percentage points
-    )
+        # Simple value flag vs ML prices
+        ml_value_flag = value_flag_from_odds(p_home, ml_home, ml_away)
 
-    # Optional OU fields: we don't have a totals model here; leave None unless you add one.
-    ou_pick = None
-    ou_confidence_pct = None
-    total_edge = None
-    model_total = None
+        # OU fields — we don’t fabricate a model_total; leave None unless total exists AND you later add a total model
+        model_total = None
+        ou_pick = None
+        ou_confidence_pct = None
+        total_edge = None
+        if total_pts is not None and model_total is not None:
+            try:
+                total_edge = float(model_total) - float(total_pts)
+                if total_edge > 0: ou_pick = "Over"
+                if total_edge < 0: ou_pick = "Under"
+                if ou_pick:
+                    ou_confidence_pct = round(min(abs(total_edge) / 8.0, 0.48) * 100 + 50, 1)
+            except Exception:
+                pass
 
-    # Simple volatility proxy: closer to coinflip => higher volatility
-    volatility_score = round(2.0 * (0.5 - abs(p_home - 0.5)), 3)  # 0..1-ish
+        # Conservative defaults for extra flags
+        trap_alert = False
+        sharp_flag = False
+        volatility_score = round(min(abs(edge_vs_line or 0.0) / 10.0, 0.5), 2)
 
-    out = {
-        # Join keys (MUST echo back exactly for merging)
-        "league": league,
-        "game_time": gtime,
-        "home_team": home,
-        "away_team": away,
+        out.append({
+            "league": league, "game_time": game_time,
+            "home_team": home, "away_team": away,
 
-        # Model outputs
-        "model_ml_prob_home": float(p_home),
-        "model_ml_prob_away": float(p_away),
-        "model_pick": pick,
-        "confidence_pct": float(confidence_pct),
-        "ml_value_flag": bool(ml_value_flag),
+            "model_ml_prob_home": round(float(p_home), 4),
+            "model_ml_prob_away": round(float(p_away), 4),
+            "model_pick": model_pick,
+            "confidence_pct": float(confidence_pct),
+            "ml_value_flag": bool(ml_value_flag),
 
-        # Nice-to-haves
-        "model_spread": float(model_spread),
-        "edge_vs_line": float(edge_vs_line) if edge_vs_line is not None else None,
-        "model_total": model_total,
-        "ou_pick": ou_pick,
-        "ou_confidence_pct": ou_confidence_pct,
-        "total_edge": total_edge,
+            "model_spread": float(model_spread),
+            "edge_vs_line": edge_vs_line if edge_vs_line is None else float(edge_vs_line),
 
-        # Signals (defaults; tweak if you later add logic)
-        "trap_alert": False,
-        "sharp_flag": False,
-        "volatility_score": float(volatility_score),
-    }
+            "model_total": model_total,
+            "ou_pick": ou_pick,
+            "ou_confidence_pct": ou_confidence_pct,
+            "total_edge": total_edge,
+
+            "trap_alert": trap_alert,
+            "sharp_flag": sharp_flag,
+            "volatility_score": float(volatility_score),
+        })
+
     return out
-
-# --------- Public API ---------
-def predict_games(games: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Main entry. Accepts a list of games; returns a list of prediction dicts.
-    Safe to call multiple times; model is cached after first load.
-    """
-    _load_model_once()
-    _maybe_load_metadata()
-
-    if not isinstance(games, list):
-        raise TypeError("predict_games expects a list of dicts")
-
-    out: List[Dict[str, Any]] = []
-    for g in games:
-        try:
-            out.append(_build_output_for_game(g or {}))
-        except Exception as e:
-            # Always return join keys so the caller can still merge
-            out.append({
-                "league": (g or {}).get("league"),
-                "game_time": (g or {}).get("game_time"),
-                "home_team": (g or {}).get("home_team"),
-                "away_team": (g or {}).get("away_team"),
-                "error": str(e),
-            })
-    return out
-
-# --------- CLI smoke test ---------
-if __name__ == "__main__":
-    """
-    Usage:
-      cat sample_games.json | python predict.py
-      or
-      python predict.py < sample_games.json
-    """
-    data = sys.stdin.read().strip()
-    if not data:
-        print("[]")
-        sys.exit(0)
-    try:
-        games = json.loads(data)
-    except Exception as e:
-        print(json.dumps({"error": f"Invalid JSON on stdin: {e}"}))
-        sys.exit(1)
-    try:
-        res = predict_games(games)
-        print(json.dumps(res, ensure_ascii=False))
-    except Exception as e:
-        print(json.dumps({"error": str(e)}))
-        sys.exit(1)
