@@ -861,6 +861,86 @@ def debug_env():
         "model_url": MODEL_URL,
         "model_weights_path": MODEL_WEIGHTS_PATH,
     }
+# ----- Model weights debug -----
+from pathlib import Path
+
+@app.get("/debug/model-weights")
+def debug_model_weights(inspect: bool = False, use_predict: bool = True):
+    """
+    Inspect whether the trained pickle exists and can be loaded.
+    - /debug/model-weights
+    - /debug/model-weights?inspect=1        -> attempt a direct load (safe try/except)
+    - /debug/model-weights?inspect=1&use_predict=1  -> also ask predict.py to load its model
+    """
+    import os, importlib, pickle
+    from datetime import datetime, timezone
+
+    path = os.getenv("MODEL_WEIGHTS_PATH", "final_ats_model.pkl")
+    p = Path(path)
+    exists = p.exists()
+
+    out = {
+        "path": str(p),
+        "exists": exists,
+    }
+    if exists:
+        st = p.stat()
+        out.update({
+            "filesize_bytes": st.st_size,
+            "modified_utc": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+        })
+
+    # Try the predict.py module (optional)
+    pm_info = {"imported": False}
+    if use_predict:
+        try:
+            predict = importlib.import_module("predict")
+            pm_info["imported"] = True
+
+            # If caller asked us to, nudge predict.py to load its model once
+            if inspect and hasattr(predict, "_load_model_once"):
+                try:
+                    predict._load_model_once()
+                except Exception as e:
+                    pm_info["load_error"] = str(e)
+
+            m = getattr(predict, "_MODEL", None)
+            pm_info.update({
+                "has__MODEL_attr": hasattr(predict, "_MODEL"),
+                "model_loaded": m is not None,
+                "model_type": type(m).__name__ if m is not None else None,
+                "model_path_predict_thinks": getattr(predict, "_get_model_path", lambda: None)(),
+                "has_predict_games": hasattr(predict, "predict_games"),
+            })
+        except Exception as e:
+            pm_info["error"] = str(e)
+    out["predict_module"] = pm_info
+
+    # Try a direct load of the pickle (optional when inspect=1)
+    direct = {"attempted": False}
+    if inspect and exists:
+        direct["attempted"] = True
+        try:
+            try:
+                import joblib  # preferred for sklearn
+            except Exception:
+                joblib = None
+            model = joblib.load(str(p)) if joblib else pickle.load(open(p, "rb"))
+            direct.update({
+                "ok": True,
+                "model_type": type(model).__name__,
+                "attrs": {
+                    "has_predict_proba": hasattr(model, "predict_proba"),
+                    "has_predict": hasattr(model, "predict"),
+                    "has_classes_": hasattr(model, "classes_"),
+                    "has_n_features_in_": hasattr(model, "n_features_in_"),
+                }
+            })
+        except Exception as e:
+            direct.update({"ok": False, "error": str(e)})
+    out["direct_load"] = direct
+
+    return out
 
 @app.get("/debug/odds")
 async def debug_odds():
