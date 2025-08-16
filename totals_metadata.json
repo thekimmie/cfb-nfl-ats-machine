@@ -1,0 +1,8 @@
+{
+  "features_used_total": [
+    "total_close",
+    "spread_close"
+  ],
+  "residual_std": 13.763488297205516,
+  "note": "model_total = sportsbook_total + predicted_residual(total_close, spread_close)"
+}
